@@ -43637,14 +43637,14 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         const char *text;
         int token;
     } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
+        {"<｜begin▁of▁sentence｜>", DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ? -1 : vocab->bos_id},
+        {"<｜end▁of▁sentence｜>",   DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ? -1 : vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
         {"<sop>",                  vocab->sop_id},
         {"<|system|>",             vocab->system_id},
         {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
+        {"<｜User｜>",              DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ? -1 : vocab->user_id},
+        {"<｜Assistant｜>",         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ? -1 : vocab->assistant_id},
         {"<|user|>",               vocab->user_id},
         {"<|assistant|>",          vocab->assistant_id},
         {"<|observation|>",        vocab->observation_id},
