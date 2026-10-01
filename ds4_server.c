@@ -22356,9 +22356,31 @@ static char *test_kv_text_path(const char *dir, const char *text) {
     return path_join(dir, name);
 }
 
+/* Sum of the sizes of the .kv files left in dir, measured with stat so it does
+ * not depend on the cache's own bookkeeping. */
+static uint64_t test_kv_dir_bytes(const char *dir) {
+    uint64_t total = 0;
+    DIR *d = opendir(dir);
+    TEST_ASSERT(d != NULL);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t n = strlen(de->d_name);
+        if (n < 3 || strcmp(de->d_name + n - 3, ".kv") != 0) continue;
+        char *path = path_join(dir, de->d_name);
+        struct stat st;
+        TEST_ASSERT(stat(path, &st) == 0);
+        if (stat(path, &st) == 0) total += (uint64_t)st.st_size;
+        free(path);
+    }
+    closedir(d);
+    return total;
+}
+
 /* Session switch: the main agent's evict snapshot is fresh with no hits, an
- * older session has decayed hits, and the subagent's outgoing snapshot needs
- * room for one eviction.  The main agent is the request about to load. */
+ * older session has decayed hits that score higher, and the subagent's
+ * outgoing snapshot needs room for one eviction.  The main agent is the
+ * request about to load. */
 static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
     const char *old_text = "old session transcript";
     const char *main_text = "main agent transcript";
@@ -22398,13 +22420,15 @@ static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
             .protect_text = protect ? next_prompt : NULL,
         };
         TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+        TEST_ASSERT(test_kv_dir_bytes(dir) + incoming_bytes <= kc.budget_bytes);
 
         if (protect) {
             TEST_ASSERT(access(main_path, F_OK) == 0);
             TEST_ASSERT(access(old_path, F_OK) != 0);
         } else {
-            /* Without protection the recent hits outweigh the newcomer
-             * grace, which is the failure this test guards against. */
+            /* Without protection the older session's hits score higher, so
+             * the main agent's snapshot is evicted: the failure this test
+             * guards against. */
             TEST_ASSERT(access(main_path, F_OK) != 0);
             TEST_ASSERT(access(old_path, F_OK) == 0);
         }
@@ -22464,6 +22488,7 @@ static void test_kv_cache_eviction_protects_after_earlier_victims(void) {
         .protect_text = protect_text,
     };
     TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+    TEST_ASSERT(test_kv_dir_bytes(dir) + incoming_bytes <= kc.budget_bytes);
 
     for (int i = 0; i < 3; i++) {
         char *path = test_kv_text_path(dir, texts[i]);
@@ -22511,7 +22536,9 @@ static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
     };
     /* Even deleting every other entry cannot make room next to the
      * protected checkpoint: report failure and delete nothing. */
+    const uint64_t bytes_before = test_kv_dir_bytes(dir);
     TEST_ASSERT(!kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+    TEST_ASSERT(test_kv_dir_bytes(dir) == bytes_before);
     TEST_ASSERT(access(main_path, F_OK) == 0);
     TEST_ASSERT(access(small_path, F_OK) == 0);
 
@@ -22521,46 +22548,6 @@ static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
     free(small_path);
     free(main_path);
     rmdir(dir);
-}
-
-static void test_kv_cache_eviction_grace_for_fresh_evict_snapshot(void) {
-    const char *old_text = "old session transcript";
-    const char *main_text = "main agent transcript";
-    const uint64_t now = (uint64_t)time(NULL);
-    const uint64_t hour_ago = now - 3600u;
-
-    for (int fresh = 1; fresh >= 0; fresh--) {
-        char tmpl[] = "/tmp/ds4-kv-evict-grace-test.XXXXXX";
-        char *dir = mkdtemp(tmpl);
-        TEST_ASSERT(dir != NULL);
-        if (!dir) return;
-
-        uint64_t main_at = fresh ? now :
-            now - DS4_KVSTORE_EVICT_GRACE_SECONDS - 60u;
-        test_kv_text_stub_file_used(dir, old_text, 0, KV_REASON_COLD,
-                                    2048, 2, hour_ago, hour_ago, 2048);
-        test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
-                                    2048, 0, main_at, main_at, 2048);
-        char *old_path = test_kv_text_path(dir, old_text);
-        char *main_path = test_kv_text_path(dir, main_text);
-
-        kv_disk_cache kc = {0};
-        kc.enabled = true;
-        kc.dir = xstrdup(dir);
-        kc.opt = kv_cache_default_options();
-        kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u + strlen(old_text) + 2048u;
-        TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, NULL));
-
-        TEST_ASSERT((access(main_path, F_OK) == 0) == (fresh != 0));
-        TEST_ASSERT((access(old_path, F_OK) == 0) == (fresh == 0));
-
-        kv_cache_close(&kc);
-        unlink(old_path);
-        unlink(main_path);
-        free(old_path);
-        free(main_path);
-        rmdir(dir);
-    }
 }
 
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
@@ -23433,7 +23420,6 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_protects_checkpoint_about_to_load();
     test_kv_cache_eviction_protects_after_earlier_victims();
     test_kv_cache_eviction_keeps_protected_checkpoint_when_full();
-    test_kv_cache_eviction_grace_for_fresh_evict_snapshot();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

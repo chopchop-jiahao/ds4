@@ -11,10 +11,6 @@
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
-/* A session switched out of the live slot usually comes back after a short
- * detour (for example a subagent).  Its fresh evict snapshot has no hits yet,
- * so give it a starting hit count for this long. */
-#define DS4_KVSTORE_EVICT_GRACE_SECONDS (30ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)

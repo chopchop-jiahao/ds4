@@ -54,10 +54,6 @@
  * survive comparable continued entries, while still allowing pressure and poor
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
-/* Minimum effective hits of an evict snapshot during
- * DS4_KVSTORE_EVICT_GRACE_SECONDS, so it is not the first victim when the next
- * session stores its own snapshot. */
-#define KV_CACHE_EVICT_GRACE_HITS 2.0
 
 typedef struct {
     char *ptr;
@@ -581,13 +577,6 @@ double ds4_kvstore_entry_eviction_score(
         double elapsed = (double)(now - used_at);
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
-    }
-    if (e->reason == DS4_KVSTORE_REASON_EVICT && e->created_at != 0 &&
-        now >= e->created_at &&
-        now - e->created_at < DS4_KVSTORE_EVICT_GRACE_SECONDS &&
-        effective_hits < KV_CACHE_EVICT_GRACE_HITS)
-    {
-        effective_hits = KV_CACHE_EVICT_GRACE_HITS;
     }
     double score = (effective_hits + 1.0) *
                    (double)e->tokens / (double)e->file_size;
