@@ -22418,6 +22418,63 @@ static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
     }
 }
 
+static void test_kv_cache_eviction_protects_after_earlier_victims(void) {
+    char tmpl[] = "/tmp/ds4-kv-protect-shift-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* Equal-length texts give equal file sizes.  readdir order is arbitrary,
+     * so first observe it, then make the last entry the protected one.  Both
+     * victims sit before it and are deleted first, which shifts its index. */
+    const char *texts[3] = {"transcript a", "transcript b", "transcript c"};
+    for (int i = 0; i < 3; i++)
+        test_kv_text_stub_file_used(dir, texts[i], 0, KV_REASON_COLD,
+                                    2048, 0, 100, 100, 2048);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    int last = -1;
+    for (int i = 0; i < 3; i++)
+        if (kv_cache_find_text_prefix(&kc, texts[i], 2, 32768) == 2) last = i;
+    TEST_ASSERT(last >= 0);
+    if (last < 0) last = 0;
+
+    /* The protected entry is the cheapest victim: a stale, never-hit
+     * continued checkpoint.  Rewriting in place keeps the directory order. */
+    test_kv_text_stub_file_used(dir, texts[last], 0, KV_REASON_CONTINUED,
+                                2048, 0, 100, 100, 2048);
+    char protect_text[64];
+    snprintf(protect_text, sizeof(protect_text), "%s\nuser: next", texts[last]);
+
+    const char *sub_text = "subagent transcript";
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(texts[last]) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = sub_text,
+        .text_len = strlen(sub_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+        .protect_text = protect_text,
+    };
+    TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+
+    for (int i = 0; i < 3; i++) {
+        char *path = test_kv_text_path(dir, texts[i]);
+        TEST_ASSERT((access(path, F_OK) == 0) == (i == last));
+        unlink(path);
+        free(path);
+    }
+    kv_cache_close(&kc);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
     char tmpl[] = "/tmp/ds4-kv-protect-full-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -23374,6 +23431,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_kv_cache_eviction_protects_checkpoint_about_to_load();
+    test_kv_cache_eviction_protects_after_earlier_victims();
     test_kv_cache_eviction_keeps_protected_checkpoint_when_full();
     test_kv_cache_eviction_grace_for_fresh_evict_snapshot();
 }
