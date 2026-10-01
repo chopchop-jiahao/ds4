@@ -11141,10 +11141,10 @@ static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
 #endif
 
 #ifdef DS4_SERVER_TEST
-static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
+static bool kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
                            uint64_t extra_bytes,
                            const ds4_kvstore_eviction_context *incoming) {
-    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
+    return ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -11260,7 +11260,8 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protect_text) {
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
@@ -11281,6 +11282,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
+                                                  protect_text,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     pthread_mutex_unlock(&s->inference_mu);
@@ -11291,11 +11293,14 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, slot, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
+/* protect_text is the prompt about to be looked up on disk, if any: storing
+ * the outgoing checkpoint must not evict the one that request will load. */
 static void kv_cache_store_current(server *s, server_slot *slot,
-                                   const char *reason) {
+                                   const char *reason,
+                                   const char *protect_text) {
     if (!s || !slot) return;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
     if (!tokens) return;
@@ -11331,10 +11336,12 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protect_text);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protect_text);
     }
 }
 
@@ -13596,7 +13603,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, slot, "evict");
+        kv_cache_store_current(s, slot, "evict", j->req.prompt_text);
     }
     if (!multimodal && cached == 0) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
@@ -16119,7 +16126,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
                    i, tokens->len);
-        kv_cache_store_current(&s, slot, "shutdown");
+        kv_cache_store_current(&s, slot, "shutdown", NULL);
     }
     server_close_resources(&s);
     return 0;
@@ -21761,10 +21768,11 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+static void test_kv_text_stub_file_used(const char *dir, const char *text,
+                                        uint8_t model_id, uint8_t reason,
+                                        uint32_t tokens, uint32_t hits,
+                                        uint64_t created_at, uint64_t last_used,
+                                        uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -21778,8 +21786,8 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, hits,
+                            32768, created_at, last_used, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -21790,6 +21798,14 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_used(dir, text, model_id, reason, tokens, 0,
+                                100, 100, payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -22331,6 +22347,163 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     free(old_path);
     free(new_path);
     rmdir(dir);
+}
+
+static char *test_kv_text_path(const char *dir, const char *text) {
+    char sha[41], name[44];
+    sha1_bytes_hex(text, strlen(text), sha);
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    return path_join(dir, name);
+}
+
+/* Session switch: the main agent's evict snapshot is fresh with no hits, an
+ * older session has decayed hits, and the subagent's outgoing snapshot needs
+ * room for one eviction.  The main agent is the request about to load. */
+static void test_kv_cache_eviction_protects_checkpoint_about_to_load(void) {
+    const char *old_text = "old session transcript";
+    const char *main_text = "main agent transcript";
+    const char *sub_text = "subagent transcript";
+    const char *next_prompt = "main agent transcript\nuser: subagent result";
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t hour_ago = now - 3600u;
+
+    for (int protect = 1; protect >= 0; protect--) {
+        char tmpl[] = "/tmp/ds4-kv-protect-load-test.XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+
+        test_kv_text_stub_file_used(dir, old_text, 0, KV_REASON_COLD,
+                                    2048, 3, hour_ago, hour_ago, 2048);
+        test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
+                                    2048, 0, now, now, 2048);
+        char *old_path = test_kv_text_path(dir, old_text);
+        char *main_path = test_kv_text_path(dir, main_text);
+
+        kv_disk_cache kc = {0};
+        kc.enabled = true;
+        kc.dir = xstrdup(dir);
+        kc.opt = kv_cache_default_options();
+        uint64_t incoming_bytes =
+            KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+        kc.budget_bytes =
+            incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(old_text) + 2048u;
+        ds4_kvstore_eviction_context incoming = {
+            .text = sub_text,
+            .text_len = strlen(sub_text),
+            .model_id = 0,
+            .quant_bits = 2,
+            .ctx_size = 32768,
+            .reject_different_quant = false,
+            .protect_text = protect ? next_prompt : NULL,
+        };
+        TEST_ASSERT(kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+
+        if (protect) {
+            TEST_ASSERT(access(main_path, F_OK) == 0);
+            TEST_ASSERT(access(old_path, F_OK) != 0);
+        } else {
+            /* Without protection the recent hits outweigh the newcomer
+             * grace, which is the failure this test guards against. */
+            TEST_ASSERT(access(main_path, F_OK) != 0);
+            TEST_ASSERT(access(old_path, F_OK) == 0);
+        }
+
+        kv_cache_close(&kc);
+        unlink(old_path);
+        unlink(main_path);
+        free(old_path);
+        free(main_path);
+        rmdir(dir);
+    }
+}
+
+static void test_kv_cache_eviction_keeps_protected_checkpoint_when_full(void) {
+    char tmpl[] = "/tmp/ds4-kv-protect-full-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *small_text = "small unrelated transcript";
+    const char *main_text = "main agent transcript";
+    const char *sub_text = "subagent transcript";
+    const uint64_t now = (uint64_t)time(NULL);
+    test_kv_text_stub_file_used(dir, small_text, 0, KV_REASON_COLD,
+                                1024, 0, 100, 100, 256);
+    test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
+                                2048, 0, now, now, 2048);
+    char *small_path = test_kv_text_path(dir, small_text);
+    char *main_path = test_kv_text_path(dir, main_text);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(sub_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(main_text) + 2047u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = sub_text,
+        .text_len = strlen(sub_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+        .protect_text = "main agent transcript\nuser: subagent result",
+    };
+    /* Even deleting every other entry cannot make room next to the
+     * protected checkpoint: report failure and delete nothing. */
+    TEST_ASSERT(!kv_cache_evict(&kc, NULL, incoming_bytes, &incoming));
+    TEST_ASSERT(access(main_path, F_OK) == 0);
+    TEST_ASSERT(access(small_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(small_path);
+    unlink(main_path);
+    free(small_path);
+    free(main_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_grace_for_fresh_evict_snapshot(void) {
+    const char *old_text = "old session transcript";
+    const char *main_text = "main agent transcript";
+    const uint64_t now = (uint64_t)time(NULL);
+    const uint64_t hour_ago = now - 3600u;
+
+    for (int fresh = 1; fresh >= 0; fresh--) {
+        char tmpl[] = "/tmp/ds4-kv-evict-grace-test.XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (!dir) return;
+
+        uint64_t main_at = fresh ? now :
+            now - DS4_KVSTORE_EVICT_GRACE_SECONDS - 60u;
+        test_kv_text_stub_file_used(dir, old_text, 0, KV_REASON_COLD,
+                                    2048, 2, hour_ago, hour_ago, 2048);
+        test_kv_text_stub_file_used(dir, main_text, 0, KV_REASON_EVICT,
+                                    2048, 0, main_at, main_at, 2048);
+        char *old_path = test_kv_text_path(dir, old_text);
+        char *main_path = test_kv_text_path(dir, main_text);
+
+        kv_disk_cache kc = {0};
+        kc.enabled = true;
+        kc.dir = xstrdup(dir);
+        kc.opt = kv_cache_default_options();
+        kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u + strlen(old_text) + 2048u;
+        TEST_ASSERT(kv_cache_evict(&kc, NULL, 0, NULL));
+
+        TEST_ASSERT((access(main_path, F_OK) == 0) == (fresh != 0));
+        TEST_ASSERT((access(old_path, F_OK) == 0) == (fresh == 0));
+
+        kv_cache_close(&kc);
+        unlink(old_path);
+        unlink(main_path);
+        free(old_path);
+        free(main_path);
+        rmdir(dir);
+    }
 }
 
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
@@ -23200,6 +23373,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
+    test_kv_cache_eviction_protects_checkpoint_about_to_load();
+    test_kv_cache_eviction_keeps_protected_checkpoint_when_full();
+    test_kv_cache_eviction_grace_for_fresh_evict_snapshot();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -11,6 +11,10 @@
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
+/* A session switched out of the live slot usually comes back after a short
+ * detour (for example a subagent).  Its fresh evict snapshot has no hits yet,
+ * so give it a starting hit count for this long. */
+#define DS4_KVSTORE_EVICT_GRACE_SECONDS (30ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
@@ -86,6 +90,9 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    /* Prompt text of the request that will load from disk right after this
+     * store.  The checkpoint it would load is never chosen as a victim. */
+    const char *protect_text;
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -153,7 +160,7 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
                                         const ds4_tokens *live,
                                         uint64_t now,
                                         const ds4_kvstore_eviction_context *incoming);
-void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
+bool ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
@@ -168,6 +175,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protect_text,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);
