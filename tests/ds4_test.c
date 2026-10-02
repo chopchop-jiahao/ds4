@@ -6955,9 +6955,10 @@ static void test_tool_call_quality(void) {
  * chunk, so the caller can confirm the multi-row verify path actually ran. */
 static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *prompt,
                                          int max_tokens, int *out, int *out_len,
-                                         int *max_chunk) {
+                                         int *max_chunk, int *single_cycles) {
     *out_len = 0;
     *max_chunk = 0;
+    if (single_cycles) *single_cycles = 0;
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + max_tokens + 16) == 0);
     if (!session) return false;
@@ -6979,6 +6980,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
         if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;
+        if (ntok == 1 && single_cycles) (*single_cycles)++;
 
         for (int j = 0; j < ntok; j++) {
             if (toks[j] == eos) { stop = true; break; }
@@ -7111,7 +7113,7 @@ static void test_mtp_verify_depth(void) {
     if (spec && prompt.len > 0) {
         int nspec = 0, max_chunk = 0;
         const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
-                                                          spec, &nspec, &max_chunk);
+                                                          spec, &nspec, &max_chunk, NULL);
         TEST_ASSERT(ok_spec);
         TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
         TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
@@ -7127,6 +7129,72 @@ static void test_mtp_verify_depth(void) {
     }
 
     free(spec);
+    ds4_tokens_free(&prompt);
+}
+
+/* GLM 5.3 embedded MTP: every token the speculative path commits must be a
+ * (near-)argmax of plain decode over the same history.  A run must both accept
+ * and reject drafts so the two-token commit and the rejection recovery are
+ * exercised.  DS4_TEST_GLM_MTP_PROMPT gives a long prompt; DS4_TEST_GLM_MTP_DUMP
+ * writes the committed token ids so two builds can be diffed. */
+static void test_glm_mtp_verify(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-verify skipped (needs a GLM 5.3 model and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+
+    const char *prompt_path = getenv("DS4_TEST_GLM_MTP_PROMPT");
+    char *prompt_text = prompt_path && prompt_path[0] ? test_read_file(prompt_path) : NULL;
+    if (prompt_path && prompt_path[0]) {
+        TEST_ASSERT(prompt_text != NULL);
+        if (!prompt_text) return;
+    }
+    uint32_t max_gen = test_env_u32("DS4_TEST_GLM_MTP_TOKENS");
+    if (max_gen == 0) max_gen = TEST_MTP_MAXGEN;
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            prompt_text ? prompt_text : test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+
+    int *spec = malloc((size_t)max_gen * sizeof(*spec));
+    TEST_ASSERT(spec != NULL);
+    if (spec && prompt.len > 0) {
+        int nspec = 0, max_chunk = 0, single = 0;
+        const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, (int)max_gen,
+                                                          spec, &nspec, &max_chunk, &single);
+        TEST_ASSERT(ok_spec);
+        TEST_ASSERT(max_chunk == 2);  /* drafts were accepted: two-token commits ran */
+        TEST_ASSERT(single > 0);      /* drafts were rejected: the recovery path ran */
+        TEST_ASSERT(nspec >= 64);
+
+        const char *dump = getenv("DS4_TEST_GLM_MTP_DUMP");
+        if (dump && dump[0]) {
+            FILE *fp = fopen(dump, "w");
+            TEST_ASSERT(fp != NULL);
+            if (fp) {
+                for (int i = 0; i < nspec; i++) fprintf(fp, "%d\n", spec[i]);
+                fclose(fp);
+            }
+        }
+
+        float worst_gap = 0.0f;
+        int worst_at = -1;
+        const bool ok_check = test_mtp_worst_argmax_gap(engine, &prompt, spec, nspec,
+                                                        &worst_gap, &worst_at);
+        TEST_ASSERT(ok_check);
+        fprintf(stderr,
+                "ds4-test: glm-mtp-verify prompt=%d nspec=%d single_cycles=%d "
+                "worst_argmax_gap=%.3f at=%d\n",
+                prompt.len, nspec, single, worst_gap, worst_at);
+        TEST_ASSERT(worst_gap <= 2.0f);
+    }
+
+    free(spec);
+    free(prompt_text);
     ds4_tokens_free(&prompt);
 }
 
@@ -7166,7 +7234,7 @@ static void test_dspark_verify_depth(void) {
             const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
                                                               TEST_DSPARK_MAXGEN,
                                                               spec, &nspec,
-                                                              &max_chunk);
+                                                              &max_chunk, NULL);
             TEST_ASSERT(ok_spec);
             TEST_ASSERT(max_chunk > 1);
             TEST_ASSERT(nspec > 64);
@@ -7224,6 +7292,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
+    {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
@@ -7256,6 +7325,9 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SNAPSHOT_PROMPT=FILE  Prompt for the session snapshot round trip.");
     puts("  DS4_TEST_SNAPSHOT_CTX=N        Context for the session snapshot round trip.");
     puts("  DS4_TEST_GLM_MTP=1             Include embedded GLM MTP in snapshot verification.");
+    puts("  DS4_TEST_GLM_MTP_PROMPT=FILE   User prompt for --glm-mtp-verify.");
+    puts("  DS4_TEST_GLM_MTP_TOKENS=N      Tokens to generate in --glm-mtp-verify. Default: 256.");
+    puts("  DS4_TEST_GLM_MTP_DUMP=FILE     Write the committed token ids from --glm-mtp-verify.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
