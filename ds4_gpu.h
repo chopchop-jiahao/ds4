@@ -1686,6 +1686,36 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+/* Same kernel as ..._decode_typed_tensor over n_rows consecutive token rows
+ * (q, qk_low, heads and selected are row-major); GLM 5.3 MTP verify. */
+int ds4_gpu_glm_attention_indexed_decode_rows_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              n_rows);
+
 int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *partial_lora,
@@ -3274,6 +3304,37 @@ int ds4_gpu_glm53_kda_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+
+/* GLM 5.3 MTP verify: runs n_rows decode rows in order on the single decode
+ * state, snapshotting conv/recurrent state after rows 0..snap_rows-1.  The
+ * snapshot layout is conv then state (same as glm53_graph_copy_spec_state). */
+int ds4_gpu_glm53_kda_decode_rows_snap(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        ds4_gpu_tensor       *snap0,
+        uint64_t              snap0_offset,
+        ds4_gpu_tensor       *snap1,
+        uint64_t              snap1_offset,
+        uint32_t              snap_rows,
         float                 gate_lower_bound,
         float                 norm_eps);
 

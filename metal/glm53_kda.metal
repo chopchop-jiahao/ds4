@@ -159,6 +159,191 @@ kernel void kernel_glm53_kda_decode(
     }
 }
 
+struct glm53_kda_rows_args {
+    uint n_heads;
+    uint n_rows;
+    uint snap_rows;
+    float lower_bound;
+    float norm_eps;
+};
+
+/*
+ * MTP verify: one threadgroup per head runs the 2-3 verify rows in order on
+ * the single decode state with the exact per-row code of
+ * kernel_glm53_kda_decode, and copies the state after rows 0..snap_rows-1
+ * into the snapshot buffers.  Each thread copies only values it wrote itself.
+ */
+kernel void kernel_glm53_kda_decode_rows_snap(
+        constant glm53_kda_rows_args &args,
+        device const float   *q_in,
+        device const float   *k_in,
+        device const float   *v_in,
+        device const float   *raw_gate,
+        device const float   *raw_beta,
+        device const float   *output_gate,
+        device const float   *q_conv,
+        device const float   *k_conv,
+        device const float   *v_conv,
+        device const float   *a_log,
+        device const float   *dt_bias,
+        device const float   *output_norm,
+        device float         *conv_state,
+        device float         *state,
+        device float         *out,
+        device float         *snap0_conv,
+        device float         *snap0_state,
+        device float         *snap1_conv,
+        device float         *snap1_state,
+        threadgroup float    *scratch [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint D = 128u;
+    constexpr uint HISTORY = 3u;
+    const uint head = tgpig.y;
+    if (head >= args.n_heads) return;
+
+    threadgroup float *sq = scratch;
+    threadgroup float *sk = sq + D;
+    threadgroup float *sd = sk + D;
+    threadgroup float *sv = sd + D;
+    threadgroup float *so = sv + D;
+    threadgroup float *reduce_q = so + D;
+    threadgroup float *reduce_k = reduce_q + 4u;
+    threadgroup float *reduce_o = reduce_k + 4u;
+    threadgroup float *beta_shared = reduce_o + 4u;
+
+    const uint projection = args.n_heads * D;
+    const uint channel = head * D + tid;
+    device float *q_state = conv_state;
+    device float *k_state = q_state + HISTORY * projection;
+    device float *v_state = k_state + HISTORY * projection;
+    const uint k0 = lane * 4u;
+    const ulong state_head = (ulong)head * D * D;
+
+    for (uint row = 0; row < args.n_rows; row++) {
+        if (row != 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup |
+                               mem_flags::mem_device);
+        }
+        const ulong input_base = (ulong)row * projection + head * D;
+
+        if (tid < D) {
+            float q_acc = 0.0f;
+            float k_acc = 0.0f;
+            float v_acc = 0.0f;
+            for (uint w = 0; w < HISTORY; w++) {
+                q_acc = fma(q_state[(ulong)w * projection + channel],
+                            q_conv[(ulong)channel * 4u + w], q_acc);
+                k_acc = fma(k_state[(ulong)w * projection + channel],
+                            k_conv[(ulong)channel * 4u + w], k_acc);
+                v_acc = fma(v_state[(ulong)w * projection + channel],
+                            v_conv[(ulong)channel * 4u + w], v_acc);
+            }
+            const float q_new = q_in[input_base + tid];
+            const float k_new = k_in[input_base + tid];
+            const float v_new = v_in[input_base + tid];
+            q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
+            k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
+            v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
+
+            q_state[channel] = q_state[projection + channel];
+            q_state[projection + channel] = q_state[2ul * projection + channel];
+            q_state[2ul * projection + channel] = q_new;
+            k_state[channel] = k_state[projection + channel];
+            k_state[projection + channel] = k_state[2ul * projection + channel];
+            k_state[2ul * projection + channel] = k_new;
+            v_state[channel] = v_state[projection + channel];
+            v_state[projection + channel] = v_state[2ul * projection + channel];
+            v_state[2ul * projection + channel] = v_new;
+
+            sq[tid] = q_acc / (1.0f + exp(-q_acc));
+            sk[tid] = k_acc / (1.0f + exp(-k_acc));
+            sv[tid] = v_acc / (1.0f + exp(-v_acc));
+            const float gate = raw_gate[input_base + tid] + dt_bias[channel];
+            sd[tid] = exp(args.lower_bound *
+                          (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
+        }
+        if (tid == 0u) {
+            beta_shared[0] =
+                1.0f / (1.0f + exp(-raw_beta[(ulong)row * args.n_heads + head]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup |
+                           mem_flags::mem_device);
+
+        float q_sumsq = sq[tid] * sq[tid];
+        float k_sumsq = sk[tid] * sk[tid];
+        q_sumsq = simd_sum(q_sumsq);
+        k_sumsq = simd_sum(k_sumsq);
+        if (lane == 0u) {
+            reduce_q[sg] = q_sumsq;
+            reduce_k[sg] = k_sumsq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+        float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+        q_total = simd_sum(q_total);
+        k_total = simd_sum(k_total);
+        const float q_scale = rsqrt(q_total + 1.0e-6f) * 0x1.6a09e6p-4f;
+        const float k_scale = rsqrt(k_total + 1.0e-6f);
+        if (tid < D) {
+            sq[tid] *= q_scale;
+            sk[tid] *= k_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float4 q4 = *((threadgroup float4 *)(sq + k0));
+        const float4 k4 = *((threadgroup float4 *)(sk + k0));
+        const float4 decay4 = *((threadgroup float4 *)(sd + k0));
+
+        for (uint value = sg; value < D; value += 4u) {
+            device float4 *hptr =
+                (device float4 *)(state + state_head + (ulong)value * D + k0);
+            float4 h = *hptr * decay4;
+            float hk = dot(h, k4);
+            hk = simd_sum(hk);
+            const float delta_v = (sv[value] - hk) * beta_shared[0];
+            h = fma(k4, float4(delta_v), h);
+            *hptr = h;
+            float hq = simd_sum(dot(h, q4));
+            if (lane == 0u) so[value] = hq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup |
+                           mem_flags::mem_device);
+
+        float o_sumsq = so[tid] * so[tid];
+        o_sumsq = simd_sum(o_sumsq);
+        if (lane == 0u) reduce_o[sg] = o_sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float o_total = lane < 4u ? reduce_o[lane] : 0.0f;
+        o_total = simd_sum(o_total);
+        const float o_scale = rsqrt(o_total / (float)D + args.norm_eps);
+        if (tid < D) {
+            const ulong index = input_base + tid;
+            const float gate =
+                1.0f / (1.0f + exp(-output_gate[index]));
+            out[index] = so[tid] * o_scale * output_norm[tid] * gate;
+        }
+
+        if (row < args.snap_rows) {
+            device float *snap_conv = row == 0u ? snap0_conv : snap1_conv;
+            device float *snap_state = row == 0u ? snap0_state : snap1_state;
+            if (tid < D) {
+                for (uint w = 0; w < 3u * HISTORY; w++) {
+                    const ulong i = (ulong)w * projection + channel;
+                    snap_conv[i] = conv_state[i];
+                }
+            }
+            for (uint value = sg; value < D; value += 4u) {
+                const ulong i = state_head + (ulong)value * D + k0;
+                *((device float4 *)(snap_state + i)) =
+                    *((device const float4 *)(state + i));
+            }
+        }
+    }
+}
+
 kernel void kernel_glm53_kda_prefill_prepare(
         constant glm53_kda_args &args,
         device float         *q,

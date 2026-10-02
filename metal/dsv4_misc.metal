@@ -3195,6 +3195,14 @@ kernel void kernel_glm_attention_indexed_decode(
     if (head >= args.n_head || args.n_selected == 0u) return;
     const uint nth = ntg_u.x;
     const uint qk_dim = args.qk_nope + args.qk_rope;
+
+    /* GLM 5.3 MTP verify dispatches one grid row per token row (tgpig.y).
+     * Decode dispatches a single row, so every offset below is zero there. */
+    const uint64_t qrow = tgpig.y;
+    q += qrow * args.n_head * qk_dim * sizeof(float);
+    qk_low += qrow * args.n_head * args.kv_lora_dim * sizeof(float);
+    selected += qrow * args.n_selected;
+    heads += qrow * args.n_head * args.value_dim * sizeof(float);
     threadgroup float *red = scratch;
     threadgroup float *scores = scratch + 256u;
     threadgroup float *lora_sum = scores + args.n_selected;

@@ -48120,7 +48120,51 @@ static bool glm53_graph_kda_attention_rows(
      * decode kernel and snapshots the state after row 0 (and row 1), so a
      * rejected draft restores the snapshot instead of replaying decode. */
     const bool snap_rows = g->mtp_snap_rows != 0 && rows >= 2u && rows <= 3u;
-    if (ok && snap_rows) {
+    bool fused_rows = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    fused_rows = snap_rows && getenv("DS4_GLM_VERIFY_NO_KDA_FUSED") == NULL;
+#endif
+    if (ok && fused_rows) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* One dispatch runs the rows in order on the decode state and writes
+         * the post-row-0 (and post-row-1) snapshots the per-row loop below
+         * would copy. */
+        uint32_t snaps = 0;
+        while (snaps < g->mtp_snap_rows && snaps < 2u && snaps < rows &&
+               g->mtp_state_row[snaps]) {
+            snaps++;
+        }
+        const uint64_t state_off = glm53_graph_spec_state_offset(g, il);
+        ok = ds4_gpu_glm53_kda_decode_rows_snap(
+                g->batch_kda_out,
+                g->layer_kda_conv_state[il],
+                g->layer_kda_recurrent_state[il],
+                g->batch_kda_q,
+                g->batch_kda_k,
+                g->batch_kda_v,
+                g->batch_kda_raw_gate,
+                g->batch_kda_raw_beta,
+                g->batch_kda_output_gate,
+                model->map,
+                model->size,
+                l->kda_q_conv->abs_offset,
+                l->kda_k_conv->abs_offset,
+                l->kda_v_conv->abs_offset,
+                l->kda_a_log->abs_offset,
+                l->kda_dt_bias->abs_offset,
+                l->kda_o_norm->abs_offset,
+                DS4_N_KDA_HEAD,
+                rows,
+                snaps > 0u ? g->mtp_state_row[0] : NULL,
+                state_off,
+                snaps > 1u ? g->mtp_state_row[1] : NULL,
+                state_off,
+                snaps,
+                DS4_KDA_GATE_LOWER_BOUND,
+                DS4_RMS_EPS) != 0;
+        if (ok) g->mtp_snap_captured += snaps;
+#endif
+    } else if (ok && snap_rows) {
         const uint64_t act_bytes = (uint64_t)projection * sizeof(float);
         const uint64_t beta_bytes = (uint64_t)DS4_N_KDA_HEAD * sizeof(float);
         const uint64_t state_off = glm53_graph_spec_state_offset(g, il);
@@ -54096,7 +54140,17 @@ static bool glm_graph_forward_indexed_tokens(
     const bool use_batch_ffn = glm_graph_indexed_prefill_batch_ffn();
     const bool stage_sync =
         glm_graph_small_prefill_stage_sync(n_tokens, logits_out != NULL);
+    /* The GLM 5.3 MTP verify pass (2-3 rows, snapshots requested by
+     * ds4_session_glm53_fast_spec_cycle).  It commits every 4 layers like
+     * decode so CPU encoding overlaps GPU work, and never drains mid-pass. */
+    const bool glm53_verify_pass =
+        g->glm53 && g->mtp_snap_rows != 0 &&
+        n_tokens >= 2u && n_tokens <= 3u &&
+        logits_out != NULL && !g->ssd_streaming;
+    const bool glm53_verify_flush4 =
+        glm53_verify_pass && getenv("DS4_GLM_VERIFY_NO_FLUSH4") == NULL;
     const uint32_t layer_flush_interval = stage_sync ? 0u :
+        glm53_verify_flush4 ? 4u :
         glm_graph_full_prefill_layer_flush_interval(n_tokens,
                                                     n_tokens,
                                                     logits_out != NULL);
@@ -54106,7 +54160,8 @@ static bool glm_graph_forward_indexed_tokens(
                                                   display_progress,
                                                   work_total);
     const uint32_t drain_interval =
-        progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
+        progress_flush_interval != 0 && !glm53_verify_flush4 ?
+            glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
     /* Generic IQ2 GLM benefits from sequential layer reads on large continued
      * chunks too. Keep the typed Flash path's selected-expert cache reuse. */
@@ -54954,7 +55009,47 @@ static bool glm_graph_forward_indexed_tokens(
                 if (!ok) {
                     fprintf(stderr, "ds4: GLM sliced indexed prefill failed to create attention views at layer %u token %u\n", il, t0);
                 }
-                if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
+                /* GLM 5.3 MTP verify: the decode attention kernel (value
+                 * projection fused) with one grid row per token row, so each
+                 * row attends exactly like one-token decode at pos0 + t0 + r. */
+                bool glm53_rows_attn = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                glm53_rows_attn = glm53_verify_pass && !slice_causal &&
+                                  !tp_attn_head_split &&
+                                  getenv("DS4_GLM_VERIFY_NO_ATTN_ROWS") == NULL;
+#endif
+                if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && glm53_rows_attn) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                    ok = ds4_gpu_glm_attention_indexed_decode_rows_typed_tensor(
+                            heads_view,
+                            q_view,
+                            qk_low_view,
+                            g->layer_kv_lora_cache[il],
+                            g->layer_k_rope_cache[il],
+                            model->map,
+                            model->size,
+                            l->attn_v_b->abs_offset,
+                            l->attn_v_b->type,
+                            selected_view,
+                            last_indexer_selected_count,
+                            g->compact_cache_cap,
+                            glm_graph_compact_cache_is_f16(),
+                            DS4_N_HEAD,
+                            DS4_N_KV_LORA,
+                            (uint32_t)g->q_nope,
+                            DS4_N_ROT,
+                            DS4_N_VALUE_MLA,
+                            0,
+                            rope_base,
+                            rope_scale,
+                            0.0f,
+                            1.0f,
+                            DS4_ROPE_YARN_BETA_FAST,
+                            DS4_ROPE_YARN_BETA_SLOW,
+                            slice) != 0;
+                    if (!ok) fprintf(stderr, "ds4: GLM 5.3 verify row attention failed at layer %u token %u\n", il, t0);
+#endif
+                } else if (ok && use_split_value_proj) {
                     int rc = 0;
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
                     if (slice_causal &&

@@ -36736,7 +36736,7 @@ int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
                                                               value_dim);
 }
 
-int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+static int ds4_gpu_glm_attention_indexed_decode_rows_impl(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *qk_low,
@@ -36761,12 +36761,13 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         float                 ext_factor,
         float                 attn_factor,
         float                 beta_fast,
-        float                 beta_slow) {
+        float                 beta_slow,
+        uint32_t              n_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     const uint32_t qk_dim = qk_nope + qk_rope;
     if (!heads || !q || !qk_low || !kv_lora_cache || !k_rope_cache ||
         !model_map || !selected ||
-        n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
+        n_rows == 0 || n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
         n_head == 0 || kv_lora_dim == 0 ||
         qk_nope == 0 || (qk_rope & 1u) != 0 ||
         value_dim == 0 || qk_dim < qk_nope ||
@@ -36792,12 +36793,12 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         }
         const uint64_t value_weight_rows = (uint64_t)n_head * value_dim;
         const uint64_t value_weight_bytes = value_weight_rows * value_row_bytes;
-        const uint64_t heads_bytes = (uint64_t)n_head * value_dim * sizeof(float);
-        const uint64_t q_bytes = (uint64_t)n_head * qk_dim * sizeof(float);
-        const uint64_t low_bytes = (uint64_t)n_head * kv_lora_dim * sizeof(float);
+        const uint64_t heads_bytes = (uint64_t)n_rows * n_head * value_dim * sizeof(float);
+        const uint64_t q_bytes = (uint64_t)n_rows * n_head * qk_dim * sizeof(float);
+        const uint64_t low_bytes = (uint64_t)n_rows * n_head * kv_lora_dim * sizeof(float);
         const uint64_t kv_cache_bytes = (uint64_t)cache_cap * kv_lora_dim * cache_elem_bytes;
         const uint64_t rope_cache_bytes = (uint64_t)cache_cap * qk_rope * cache_elem_bytes;
-        const uint64_t selected_bytes = (uint64_t)n_selected * sizeof(uint32_t);
+        const uint64_t selected_bytes = (uint64_t)n_rows * n_selected * sizeof(uint32_t);
         if (!headsbuf || !qbuf || !lowbuf || !kvcachebuf || !ropecachebuf || !selectedbuf ||
             ds4_gpu_tensor_bytes(heads) < heads_bytes ||
             ds4_gpu_tensor_bytes(q) < q_bytes ||
@@ -36866,7 +36867,7 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             256u + (NSUInteger)n_selected + (NSUInteger)kv_lora_dim;
         [enc setThreadgroupMemoryLength:ds4_gpu_align_up_ns(
                 scratch_floats * sizeof(float), 16u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_rows, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -36874,6 +36875,77 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    return ds4_gpu_glm_attention_indexed_decode_rows_impl(
+            heads, q, qk_low, kv_lora_cache, k_rope_cache,
+            model_map, model_size, value_weight_offset, value_weight_type,
+            selected, n_selected, cache_cap, cache_f16,
+            n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+            1);
+}
+
+int ds4_gpu_glm_attention_indexed_decode_rows_typed_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        uint32_t              value_weight_type,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              n_rows) {
+    return ds4_gpu_glm_attention_indexed_decode_rows_impl(
+            heads, q, qk_low, kv_lora_cache, k_rope_cache,
+            model_map, model_size, value_weight_offset, value_weight_type,
+            selected, n_selected, cache_cap, cache_f16,
+            n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+            n_rows);
 }
 
 int ds4_gpu_glm_attention_indexed_decode_tensor(
@@ -47591,6 +47663,178 @@ int ds4_gpu_glm53_kda_decode(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
             cb, owned, "GLM-5.3 fused KDA decode");
+    }
+}
+
+typedef struct {
+    uint32_t n_heads;
+    uint32_t n_rows;
+    uint32_t snap_rows;
+    float    lower_bound;
+    float    norm_eps;
+} glm53_gpu_kda_rows_args;
+
+int ds4_gpu_glm53_kda_decode_rows_snap(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_rows,
+        ds4_gpu_tensor       *snap0,
+        uint64_t              snap0_offset,
+        ds4_gpu_tensor       *snap1,
+        uint64_t              snap1_offset,
+        uint32_t              snap_rows,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    uint64_t projection = 0, activation_elements = 0;
+    uint64_t conv_elements = 0, state_elements = 0;
+    if (n_heads == 0 || n_rows == 0 || n_rows > 3u ||
+        snap_rows > 2u || snap_rows > n_rows ||
+        gate_lower_bound >= 0.0f ||
+        !glm53_gpu_mul_u64(n_heads, GLM53_KDA_DIM, &projection) ||
+        !glm53_gpu_mul_u64(projection, n_rows, &activation_elements) ||
+        !glm53_gpu_mul_u64(projection,
+                        3u * GLM53_KDA_HISTORY, &conv_elements) ||
+        !glm53_gpu_mul_u64(projection, GLM53_KDA_DIM, &state_elements) ||
+        !glm53_gpu_tensor_has(q, activation_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(k, activation_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(v, activation_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(raw_gate, activation_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(output_gate, activation_elements, sizeof(float)) ||
+        !glm53_gpu_tensor_has(raw_beta,
+                           (uint64_t)n_rows * n_heads, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out, activation_elements, sizeof(float)) ||
+        !conv_state || !recurrent_state ||
+        ds4_gpu_tensor_bytes(conv_state) != conv_elements * sizeof(float) ||
+        ds4_gpu_tensor_bytes(recurrent_state) != state_elements * sizeof(float)) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA verify rows received invalid buffers\n");
+        return 0;
+    }
+    uint64_t state_bytes = 0;
+    if (!glm53_gpu_mul_u64(conv_elements + state_elements,
+                         sizeof(float), &state_bytes)) {
+        return 0;
+    }
+    for (uint32_t k = 0; k < snap_rows; k++) {
+        ds4_gpu_tensor *snap = k == 0u ? snap0 : snap1;
+        uint64_t snap_off = k == 0u ? snap0_offset : snap1_offset;
+        if (!snap || !ds4_gpu_tensor_buffer(snap) ||
+            snap_off > UINT64_MAX - state_bytes ||
+            ds4_gpu_tensor_bytes(snap) < snap_off + state_bytes) {
+            fprintf(stderr, "ds4: GLM-5.3 KDA verify rows snapshot %u is undersized\n", k);
+            return 0;
+        }
+    }
+
+    uint64_t conv_bytes = 0, dt_bytes = 0;
+    if (!glm53_gpu_mul_u64(projection, 4u * sizeof(float), &conv_bytes) ||
+        !glm53_gpu_mul_u64(projection, sizeof(float), &dt_bytes)) {
+        return 0;
+    }
+    const uint64_t a_log_bytes = (uint64_t)n_heads * sizeof(float);
+    const uint64_t norm_bytes = GLM53_KDA_DIM * sizeof(float);
+
+    @autoreleasepool {
+        uint64_t qw_inner = 0, kw_inner = 0, vw_inner = 0;
+        uint64_t a_inner = 0, dt_inner = 0, norm_inner = 0;
+        id<MTLBuffer> qw = glm53_gpu_weight_buffer(
+            model_map, model_size, q_conv_offset, conv_bytes,
+            &qw_inner, "KDA Q convolution");
+        id<MTLBuffer> kw = glm53_gpu_weight_buffer(
+            model_map, model_size, k_conv_offset, conv_bytes,
+            &kw_inner, "KDA K convolution");
+        id<MTLBuffer> vw = glm53_gpu_weight_buffer(
+            model_map, model_size, v_conv_offset, conv_bytes,
+            &vw_inner, "KDA V convolution");
+        id<MTLBuffer> a_log = glm53_gpu_weight_buffer(
+            model_map, model_size, a_log_offset, a_log_bytes,
+            &a_inner, "KDA A_log");
+        id<MTLBuffer> dt_bias = glm53_gpu_weight_buffer(
+            model_map, model_size, dt_bias_offset, dt_bytes,
+            &dt_inner, "KDA dt bias");
+        id<MTLBuffer> output_norm = glm53_gpu_weight_buffer(
+            model_map, model_size, output_norm_offset, norm_bytes,
+            &norm_inner, "KDA output norm");
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_kda_decode_rows_snap");
+        if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
+            !pipeline) {
+            return 0;
+        }
+
+        glm53_gpu_kda_rows_args args = {
+            .n_heads = n_heads,
+            .n_rows = n_rows,
+            .snap_rows = snap_rows,
+            .lower_bound = gate_lower_bound,
+            .norm_eps = norm_eps,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                offset:ds4_gpu_tensor_offset(k) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(v)
+                offset:ds4_gpu_tensor_offset(v) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_gate)
+                offset:ds4_gpu_tensor_offset(raw_gate) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(raw_beta)
+                offset:ds4_gpu_tensor_offset(raw_beta) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(output_gate)
+                offset:ds4_gpu_tensor_offset(output_gate) atIndex:6];
+        [enc setBuffer:qw offset:(NSUInteger)qw_inner atIndex:7];
+        [enc setBuffer:kw offset:(NSUInteger)kw_inner atIndex:8];
+        [enc setBuffer:vw offset:(NSUInteger)vw_inner atIndex:9];
+        [enc setBuffer:a_log offset:(NSUInteger)a_inner atIndex:10];
+        [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:11];
+        [enc setBuffer:output_norm offset:(NSUInteger)norm_inner atIndex:12];
+        [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                offset:ds4_gpu_tensor_offset(conv_state) atIndex:13];
+        [enc setBuffer:ds4_gpu_tensor_buffer(recurrent_state)
+                offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:14];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                offset:ds4_gpu_tensor_offset(out) atIndex:15];
+        const uint64_t conv_state_bytes = conv_elements * sizeof(float);
+        ds4_gpu_tensor *s0 = snap_rows > 0 ? snap0 : conv_state;
+        ds4_gpu_tensor *s1 = snap_rows > 1 ? snap1 : conv_state;
+        const uint64_t s0_off = snap_rows > 0 ? snap0_offset : 0;
+        const uint64_t s1_off = snap_rows > 1 ? snap1_offset : 0;
+        [enc setBuffer:ds4_gpu_tensor_buffer(s0)
+                offset:ds4_gpu_tensor_offset(s0) + (NSUInteger)s0_off atIndex:16];
+        [enc setBuffer:ds4_gpu_tensor_buffer(s0)
+                offset:ds4_gpu_tensor_offset(s0) + (NSUInteger)(snap_rows > 0 ? s0_off + conv_state_bytes : 0) atIndex:17];
+        [enc setBuffer:ds4_gpu_tensor_buffer(s1)
+                offset:ds4_gpu_tensor_offset(s1) + (NSUInteger)s1_off atIndex:18];
+        [enc setBuffer:ds4_gpu_tensor_buffer(s1)
+                offset:ds4_gpu_tensor_offset(s1) + (NSUInteger)(snap_rows > 1 ? s1_off + conv_state_bytes : 0) atIndex:19];
+        [enc setThreadgroupMemoryLength:656u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, n_heads, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(
+            cb, owned, "GLM-5.3 KDA verify rows");
     }
 }
 
