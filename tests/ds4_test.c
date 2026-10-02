@@ -6955,10 +6955,12 @@ static void test_tool_call_quality(void) {
  * chunk, so the caller can confirm the multi-row verify path actually ran. */
 static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *prompt,
                                          int max_tokens, int *out, int *out_len,
-                                         int *max_chunk, int *single_cycles) {
+                                         int *max_chunk, int *single_cycles,
+                                         int *double_cycles) {
     *out_len = 0;
     *max_chunk = 0;
     if (single_cycles) *single_cycles = 0;
+    if (double_cycles) *double_cycles = 0;
     ds4_session *session = NULL;
     TEST_ASSERT(ds4_session_create(&session, engine, prompt->len + max_tokens + 16) == 0);
     if (!session) return false;
@@ -6981,6 +6983,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
         if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;
         if (ntok == 1 && single_cycles) (*single_cycles)++;
+        if (ntok == 2 && double_cycles) (*double_cycles)++;
 
         for (int j = 0; j < ntok; j++) {
             if (toks[j] == eos) { stop = true; break; }
@@ -7113,7 +7116,8 @@ static void test_mtp_verify_depth(void) {
     if (spec && prompt.len > 0) {
         int nspec = 0, max_chunk = 0;
         const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, TEST_MTP_MAXGEN,
-                                                          spec, &nspec, &max_chunk, NULL);
+                                                          spec, &nspec, &max_chunk, NULL,
+                                                          NULL);
         TEST_ASSERT(ok_spec);
         TEST_ASSERT(max_chunk > 1);  /* multi-token chunks committed: the multi-row path ran */
         TEST_ASSERT(nspec > 128);    /* enough output to surface the bug, incl. a spurious-EOS truncation */
@@ -7152,6 +7156,8 @@ static void test_glm_mtp_verify(void) {
     }
     uint32_t max_gen = test_env_u32("DS4_TEST_GLM_MTP_TOKENS");
     if (max_gen == 0) max_gen = TEST_MTP_MAXGEN;
+    uint32_t want_chunk = test_env_u32("DS4_TEST_GLM_MTP_MAX_CHUNK");
+    if (want_chunk == 0) want_chunk = 2;
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -7163,13 +7169,15 @@ static void test_glm_mtp_verify(void) {
     int *spec = malloc((size_t)max_gen * sizeof(*spec));
     TEST_ASSERT(spec != NULL);
     if (spec && prompt.len > 0) {
-        int nspec = 0, max_chunk = 0, single = 0;
+        int nspec = 0, max_chunk = 0, single = 0, dbl = 0;
         const bool ok_spec = test_mtp_capture_speculative(engine, &prompt, (int)max_gen,
-                                                          spec, &nspec, &max_chunk, &single);
+                                                          spec, &nspec, &max_chunk, &single,
+                                                          &dbl);
         TEST_ASSERT(ok_spec);
-        TEST_ASSERT(max_chunk == 2);  /* drafts were accepted: two-token commits ran */
+        TEST_ASSERT(max_chunk == (int)want_chunk);  /* the widest commit the fixed depth allows ran */
         TEST_ASSERT(single > 0);      /* drafts were rejected: the recovery path ran */
         TEST_ASSERT(nspec >= 64);
+        if (want_chunk == 3) TEST_ASSERT(dbl > 0);  /* first draft accepted, second rejected */
 
         const char *dump = getenv("DS4_TEST_GLM_MTP_DUMP");
         if (dump && dump[0]) {
@@ -7187,9 +7195,9 @@ static void test_glm_mtp_verify(void) {
                                                         &worst_gap, &worst_at);
         TEST_ASSERT(ok_check);
         fprintf(stderr,
-                "ds4-test: glm-mtp-verify prompt=%d nspec=%d single_cycles=%d "
+                "ds4-test: glm-mtp-verify prompt=%d nspec=%d single_cycles=%d double_cycles=%d "
                 "worst_argmax_gap=%.3f at=%d\n",
-                prompt.len, nspec, single, worst_gap, worst_at);
+                prompt.len, nspec, single, dbl, worst_gap, worst_at);
         TEST_ASSERT(worst_gap <= 2.0f);
     }
 
@@ -7234,7 +7242,8 @@ static void test_dspark_verify_depth(void) {
             const bool ok_spec = test_mtp_capture_speculative(engine, &prompt,
                                                               TEST_DSPARK_MAXGEN,
                                                               spec, &nspec,
-                                                              &max_chunk, NULL);
+                                                              &max_chunk, NULL,
+                                                              NULL);
             TEST_ASSERT(ok_spec);
             TEST_ASSERT(max_chunk > 1);
             TEST_ASSERT(nspec > 64);
@@ -7328,6 +7337,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_PROMPT=FILE   User prompt for --glm-mtp-verify.");
     puts("  DS4_TEST_GLM_MTP_TOKENS=N      Tokens to generate in --glm-mtp-verify. Default: 256.");
     puts("  DS4_TEST_GLM_MTP_DUMP=FILE     Write the committed token ids from --glm-mtp-verify.");
+    puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Widest commit --glm-mtp-verify expects (2, or 3 with DS4_GLM_MTP_DEPTH=3). Default: 2.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");

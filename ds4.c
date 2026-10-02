@@ -39096,6 +39096,9 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
+/* Below this position the batch indexer scorer is faster than scoring each
+ * verify row with the decode scorer (measured on M3 Max: 8k slower, 64k faster). */
+#define DS4_GLM53_ROW_INDEXER_MIN_POS 16384u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
@@ -45182,6 +45185,19 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_state_backup;
     float          *mtp_logits_host;
     int             mtp_ready;
+    /* GLM-5.3 fast MTP cycle (the Qwen3.8 design): recurrent-state snapshots
+     * taken inside the verify pass after row 0 and row 1, logits for every
+     * verify row, and the nextn block's last output for chained drafts. */
+    ds4_gpu_tensor *mtp_state_row[2];
+    uint32_t        mtp_snap_rows;       /* caller: verify rows to snapshot after (0..2) */
+    uint32_t        mtp_snap_captured;   /* (layer, row) snapshots the last verify wrote */
+    float          *mtp_rows_logits;     /* caller: host [n_tokens][vocab] for every verify row */
+    ds4_gpu_tensor *mtp_rows_hidden;     /* [3][embd] */
+    ds4_gpu_tensor *mtp_rows_norm;       /* [3][embd] */
+    ds4_gpu_tensor *mtp_rows_logits_gpu; /* [3][vocab] */
+    ds4_gpu_tensor *mtp_embed_rows;      /* [3][embd] */
+    ds4_gpu_tensor *mtp_hc_rows;         /* [3][hc][embd] */
+    ds4_gpu_tensor *mtp_chain_hidden;    /* [embd] nextn output of the last MTP row */
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -47018,12 +47034,28 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_concat);
     ds4_gpu_tensor_free(g->mtp_selected);
     ds4_gpu_tensor_free(g->mtp_state_backup);
+    ds4_gpu_tensor_free(g->mtp_state_row[0]);
+    ds4_gpu_tensor_free(g->mtp_state_row[1]);
+    ds4_gpu_tensor_free(g->mtp_rows_hidden);
+    ds4_gpu_tensor_free(g->mtp_rows_norm);
+    ds4_gpu_tensor_free(g->mtp_rows_logits_gpu);
+    ds4_gpu_tensor_free(g->mtp_embed_rows);
+    ds4_gpu_tensor_free(g->mtp_hc_rows);
+    ds4_gpu_tensor_free(g->mtp_chain_hidden);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
     g->mtp_selected = NULL;
     g->mtp_state_backup = NULL;
+    g->mtp_state_row[0] = NULL;
+    g->mtp_state_row[1] = NULL;
+    g->mtp_rows_hidden = NULL;
+    g->mtp_rows_norm = NULL;
+    g->mtp_rows_logits_gpu = NULL;
+    g->mtp_embed_rows = NULL;
+    g->mtp_hc_rows = NULL;
+    g->mtp_chain_hidden = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -47997,6 +48029,9 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+static uint64_t glm53_graph_spec_state_offset(const ds4_glm_gpu_graph *g,
+                                              uint32_t il);
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -48081,7 +48116,61 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
-    if (ok) ok = ds4_gpu_glm53_kda_prefill(
+    /* The fast MTP verify runs the recurrence one row at a time with the
+     * decode kernel and snapshots the state after row 0 (and row 1), so a
+     * rejected draft restores the snapshot instead of replaying decode. */
+    const bool snap_rows = g->mtp_snap_rows != 0 && rows >= 2u && rows <= 3u;
+    if (ok && snap_rows) {
+        const uint64_t act_bytes = (uint64_t)projection * sizeof(float);
+        const uint64_t beta_bytes = (uint64_t)DS4_N_KDA_HEAD * sizeof(float);
+        const uint64_t state_off = glm53_graph_spec_state_offset(g, il);
+        const uint64_t conv_bytes = ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il]);
+        const uint64_t rec_bytes = ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il]);
+        for (uint32_t r = 0; ok && r < rows; r++) {
+            ds4_gpu_tensor *q = ds4_gpu_tensor_view(g->batch_kda_q, r * act_bytes, act_bytes);
+            ds4_gpu_tensor *k = ds4_gpu_tensor_view(g->batch_kda_k, r * act_bytes, act_bytes);
+            ds4_gpu_tensor *v = ds4_gpu_tensor_view(g->batch_kda_v, r * act_bytes, act_bytes);
+            ds4_gpu_tensor *gate = ds4_gpu_tensor_view(g->batch_kda_raw_gate, r * act_bytes, act_bytes);
+            ds4_gpu_tensor *beta = ds4_gpu_tensor_view(g->batch_kda_raw_beta, r * beta_bytes, beta_bytes);
+            ds4_gpu_tensor *ogate = ds4_gpu_tensor_view(g->batch_kda_output_gate, r * act_bytes, act_bytes);
+            ds4_gpu_tensor *out = ds4_gpu_tensor_view(g->batch_kda_out, r * act_bytes, act_bytes);
+            ok = q && k && v && gate && beta && ogate && out;
+            if (ok) ok = ds4_gpu_glm53_kda_decode(
+                    out,
+                    g->layer_kda_conv_state[il],
+                    g->layer_kda_recurrent_state[il],
+                    q, k, v, gate, beta, ogate,
+                    model->map,
+                    model->size,
+                    l->kda_q_conv->abs_offset,
+                    l->kda_k_conv->abs_offset,
+                    l->kda_v_conv->abs_offset,
+                    l->kda_a_log->abs_offset,
+                    l->kda_dt_bias->abs_offset,
+                    l->kda_o_norm->abs_offset,
+                    DS4_N_KDA_HEAD,
+                    1,
+                    DS4_KDA_GATE_LOWER_BOUND,
+                    DS4_RMS_EPS) != 0;
+            if (ok && r < g->mtp_snap_rows && r < 2u && g->mtp_state_row[r]) {
+                ok = ds4_gpu_tensor_copy(g->mtp_state_row[r], state_off,
+                                         g->layer_kda_conv_state[il], 0,
+                                         conv_bytes) != 0 &&
+                     ds4_gpu_tensor_copy(g->mtp_state_row[r], state_off + conv_bytes,
+                                         g->layer_kda_recurrent_state[il], 0,
+                                         rec_bytes) != 0;
+                if (ok) g->mtp_snap_captured++;
+            }
+            ds4_gpu_tensor_free(out);
+            ds4_gpu_tensor_free(ogate);
+            ds4_gpu_tensor_free(beta);
+            ds4_gpu_tensor_free(gate);
+            ds4_gpu_tensor_free(v);
+            ds4_gpu_tensor_free(k);
+            ds4_gpu_tensor_free(q);
+        }
+    } else if (ok) {
+        ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
@@ -48103,6 +48192,7 @@ static bool glm53_graph_kda_attention_rows(
             rows,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
+    }
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);
@@ -51274,12 +51364,58 @@ static uint64_t glm53_graph_spec_state_bytes(const ds4_glm_gpu_graph *g) {
     return total;
 }
 
-static bool glm53_graph_copy_spec_state(
+/* Byte offset of layer il inside a spec-state buffer (same layout as
+ * glm53_graph_copy_spec_state_buffer). */
+static uint64_t glm53_graph_spec_state_offset(const ds4_glm_gpu_graph *g,
+                                              uint32_t il) {
+    uint64_t offset = 0;
+    for (uint32_t j = g->layer_start; j < il && j <= g->layer_end; j++) {
+        ds4_gpu_tensor *state[2];
+        glm53_graph_spec_state_tensors(g, j, state);
+        for (uint32_t i = 0; i < 2; i++) {
+            if (state[i]) offset += ds4_gpu_tensor_bytes(state[i]);
+        }
+    }
+    return offset;
+}
+
+/* Last trunk layer: the nextn layer owns an indexer tail too, but the trunk
+ * verify never touches it, so row snapshots only cover the trunk. */
+static uint32_t glm53_graph_trunk_last_layer(const ds4_glm_gpu_graph *g) {
+    const uint32_t trunk = glm_graph_normal_layer_count();
+    const uint32_t last = trunk ? trunk - 1u : 0u;
+    return last < g->layer_end ? last : g->layer_end;
+}
+
+/* Trunk layers that own recurrent state; a verify that snapshots after r rows
+ * must capture exactly r times this many layer snapshots. */
+static uint32_t glm53_graph_spec_state_layers(const ds4_glm_gpu_graph *g) {
+    uint32_t n = 0;
+    const uint32_t last = glm53_graph_trunk_last_layer(g);
+    for (uint32_t il = g->layer_start; il <= last; il++) {
+        ds4_gpu_tensor *state[2];
+        glm53_graph_spec_state_tensors(g, il, state);
+        if (state[0]) n++;
+    }
+    return n;
+}
+
+static bool glm53_graph_mtp_ensure_row1(ds4_glm_gpu_graph *g) {
+    if (g->mtp_state_row[1]) return true;
+    const uint64_t bytes = glm53_graph_spec_state_bytes(g);
+    if (bytes == 0) return false;
+    g->mtp_state_row[1] = ds4_gpu_tensor_alloc(bytes);
+    return g->mtp_state_row[1] != NULL;
+}
+
+static bool glm53_graph_copy_spec_state_buffer(
         ds4_glm_gpu_graph *g,
-        bool save) {
-    if (!g || !g->glm53 || !g->mtp_state_backup) return false;
+        ds4_gpu_tensor    *buffer,
+        bool               save,
+        uint32_t           layer_last) {
+    if (!g || !g->glm53 || !buffer) return false;
     const uint64_t expected = glm53_graph_spec_state_bytes(g);
-    if (expected == 0 || ds4_gpu_tensor_bytes(g->mtp_state_backup) < expected) {
+    if (expected == 0 || ds4_gpu_tensor_bytes(buffer) < expected) {
         return false;
     }
     bool ok = glm_graph_begin_commands_if_needed();
@@ -51290,25 +51426,24 @@ static bool glm53_graph_copy_spec_state(
         for (uint32_t i = 0; ok && i < 2; i++) {
             if (!state[i]) continue;
             const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
-            if (save) {
-                ok = ds4_gpu_tensor_copy(g->mtp_state_backup,
-                                         offset,
-                                         state[i],
-                                         0,
-                                         bytes) != 0;
-            } else {
-                ok = ds4_gpu_tensor_copy(state[i],
-                                         0,
-                                         g->mtp_state_backup,
-                                         offset,
-                                         bytes) != 0;
+            if (il <= layer_last) {
+                ok = save ?
+                    ds4_gpu_tensor_copy(buffer, offset, state[i], 0, bytes) != 0 :
+                    ds4_gpu_tensor_copy(state[i], 0, buffer, offset, bytes) != 0;
             }
             offset += bytes;
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    return ok && offset == expected;
+    return ok && (layer_last < g->layer_end || offset == expected);
+}
+
+static bool glm53_graph_copy_spec_state(
+        ds4_glm_gpu_graph *g,
+        bool save) {
+    return g && glm53_graph_copy_spec_state_buffer(g, g->mtp_state_backup,
+                                                   save, g->layer_end);
 }
 
 static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
@@ -51328,10 +51463,21 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t state_backup_bytes = glm53_graph_spec_state_bytes(g);
     if (g->glm53 && state_backup_bytes != 0) {
         g->mtp_state_backup = ds4_gpu_tensor_alloc(state_backup_bytes);
+        g->mtp_state_row[0] = ds4_gpu_tensor_alloc(state_backup_bytes);
+        g->mtp_rows_hidden = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+        g->mtp_rows_norm = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+        g->mtp_rows_logits_gpu = ds4_gpu_tensor_alloc(3ull * DS4_N_VOCAB * sizeof(float));
+        g->mtp_embed_rows = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
+        g->mtp_hc_rows = ds4_gpu_tensor_alloc(3ull * DS4_N_HC * DS4_N_EMBD * sizeof(float));
+        g->mtp_chain_hidden = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
-        !g->mtp_selected || (g->glm53 && !g->mtp_state_backup) ||
+        !g->mtp_selected ||
+        (g->glm53 && (!g->mtp_state_backup || !g->mtp_state_row[0] ||
+                      !g->mtp_rows_hidden || !g->mtp_rows_norm ||
+                      !g->mtp_rows_logits_gpu || !g->mtp_embed_rows ||
+                      !g->mtp_hc_rows || !g->mtp_chain_hidden)) ||
         !g->mtp_logits_host) {
         fprintf(stderr,
                 "ds4: glm mtp: allocation failed kv=%s rope=%s concat=%s "
@@ -51347,12 +51493,28 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->mtp_concat);
         ds4_gpu_tensor_free(g->mtp_selected);
         ds4_gpu_tensor_free(g->mtp_state_backup);
+        ds4_gpu_tensor_free(g->mtp_state_row[0]);
+        ds4_gpu_tensor_free(g->mtp_state_row[1]);
+        ds4_gpu_tensor_free(g->mtp_rows_hidden);
+        ds4_gpu_tensor_free(g->mtp_rows_norm);
+        ds4_gpu_tensor_free(g->mtp_rows_logits_gpu);
+        ds4_gpu_tensor_free(g->mtp_embed_rows);
+        ds4_gpu_tensor_free(g->mtp_hc_rows);
+        ds4_gpu_tensor_free(g->mtp_chain_hidden);
         free(g->mtp_logits_host);
         g->mtp_kv_lora_cache = NULL;
         g->mtp_k_rope_cache = NULL;
         g->mtp_concat = NULL;
         g->mtp_selected = NULL;
         g->mtp_state_backup = NULL;
+        g->mtp_state_row[0] = NULL;
+        g->mtp_state_row[1] = NULL;
+        g->mtp_rows_hidden = NULL;
+        g->mtp_rows_norm = NULL;
+        g->mtp_rows_logits_gpu = NULL;
+        g->mtp_embed_rows = NULL;
+        g->mtp_hc_rows = NULL;
+        g->mtp_chain_hidden = NULL;
         g->mtp_logits_host = NULL;
         return false;
     }
@@ -51421,85 +51583,29 @@ static bool glm_graph_mtp_matmul(
                                                false) != 0;
 }
 
-/* One MTP step at (absolute) position pos: consumes the main model's last
- * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
- * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
- * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
-static bool glm_graph_mtp_step(
-        ds4_glm_gpu_graph *g,
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        int                next_token,
-        uint32_t           pos,
-        uint32_t           min_pos,
-        int               *draft_out) {
-    if (!g || !model || !weights || !draft_out) return false;
-    if (DS4_N_NEXTN_PREDICT == 0) return false;
-    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
-    if (pos >= cache_cap || min_pos > pos) {
-        fprintf(stderr, "ds4: glm mtp: pos %u/min %u out of range (cap %u)\n",
-                pos, min_pos, cache_cap);
-        return false;
-    }
+/* Encode one nextn block row into the open command batch: input
+ * concat(enorm(embed_row), hnorm(hidden)) at absolute position pos, attention
+ * over MTP cache slots g->mtp_selected[0..n_selected), output in g->next.
+ * hidden_hc: hidden is an mHC row and is reduced with hc_mean_weights first.
+ * Callers write g->mtp_selected and every input row before encoding. */
+static bool glm_graph_mtp_encode_row(
+        ds4_glm_gpu_graph    *g,
+        const ds4_model      *model,
+        const ds4_weights    *weights,
+        const ds4_gpu_tensor *embed_row,
+        const ds4_gpu_tensor *hidden,
+        bool                  hidden_hc,
+        uint32_t              pos,
+        uint32_t              n_selected,
+        const char          **stage_out) {
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const ds4_layer_weights *l = &weights->layer[il];
-    if (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm ||
-        !l->nextn_shared_head_norm || !l->ffn_gate_exps) {
-        fprintf(stderr, "ds4: glm mtp: nextn weights missing at layer %u\n", il);
-        return false;
-    }
     const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
     const float rope_base = layer_rope_freq_base(il);
     const float rope_scale = layer_rope_freq_scale(il);
-    const uint32_t n_selected = pos - min_pos + 1u;
-    bool input_ready = false;
-
-    if (g->placement) {
-        const int embedding_tier = g->placement[0];
-        const int mtp_tier = g->placement[il + 1u];
-        bool handoff_ok = glm_graph_ws_switch(g, embedding_tier, true);
-        if (handoff_ok) handoff_ok = glm_graph_begin_commands_if_needed();
-        if (handoff_ok) {
-            handoff_ok = glm_graph_mtp_embed_token(g,
-                                                   model,
-                                                   weights,
-                                                   next_token,
-                                                   g->next);
-        }
-        if (handoff_ok) handoff_ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
-        ds4_gpu_tensor *embedded_next = handoff_ok ? g->next : NULL;
-        if (handoff_ok) handoff_ok = glm_graph_ws_switch(g, mtp_tier, true);
-        if (handoff_ok) {
-            handoff_ok = ds4_gpu_tensor_copy_async(
-                    g->next, embedded_next,
-                    (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-        }
-        if (!handoff_ok) {
-            fprintf(stderr, "ds4: glm mtp: multi-tier input handoff failed\n");
-            return false;
-        }
-        input_ready = true;
-    }
-    if (!glm_graph_mtp_ensure(g)) {
-        fprintf(stderr, "ds4: glm mtp: ensure failed (cap %u)\n", cache_cap);
-        return false;
-    }
-
-    /* Draft attention window: absolute cache slots [min_pos..pos]. */
-    {
-        int32_t *sel = malloc((size_t)n_selected * sizeof(int32_t));
-        if (!sel) return false;
-        for (uint32_t i = 0; i < n_selected; i++) sel[i] = (int32_t)(min_pos + i);
-        const int wr = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
-                                            (uint64_t)n_selected * sizeof(int32_t));
-        free(sel);
-        if (!wr) {
-            fprintf(stderr, "ds4: glm mtp: selected write failed (%u)\n", n_selected);
-            return false;
-        }
-    }
-
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    const char *mtp_stage = "enorm";
+    bool ok = true;
     ds4_gpu_tensor *enorm_view =
         ds4_gpu_tensor_view(g->mtp_concat, 0, (uint64_t)DS4_N_EMBD * sizeof(float));
     ds4_gpu_tensor *hnorm_view =
@@ -51509,34 +51615,22 @@ static bool glm_graph_mtp_step(
     if (!enorm_view || !hnorm_view) {
         ds4_gpu_tensor_free(enorm_view);
         ds4_gpu_tensor_free(hnorm_view);
-        fprintf(stderr, "ds4: glm mtp: concat views failed\n");
         return false;
     }
-
-    const char *mtp_stage = "begin";
 #define DS4_GLM_MTP_STAGE(name_) do { if (ok) mtp_stage = (name_); } while (0)
-    bool ok = glm_graph_begin_commands_if_needed();
-    /* MTP input: concat(enorm(embed(next_token)), hnorm(h)) -> eh_proj. */
-    if (ok && !input_ready) {
-        ok = glm_graph_mtp_embed_token(g,
-                                       model,
-                                       weights,
-                                       next_token,
-                                       g->next);
-    }
     DS4_GLM_MTP_STAGE("enorm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(enorm_view,
-                                                g->next,
+                                                embed_row,
                                                 model->map,
                                                 model->size,
                                                 l->nextn_enorm->abs_offset,
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
     DS4_GLM_MTP_STAGE("hnorm");
-    const ds4_gpu_tensor *target_hidden = g->cur;
-    if (ok && g->glm53) {
+    const ds4_gpu_tensor *target_hidden = hidden;
+    if (ok && hidden_hc) {
         ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
-                                            g->hc_cur,
+                                            hidden,
                                             g->hc_mean_weights,
                                             DS4_N_EMBD,
                                             DS4_N_HC) != 0;
@@ -51794,6 +51888,108 @@ static bool glm_graph_mtp_step(
                                      g->ffn_out,
                                      g->ffn_sum,
                                      DS4_N_EMBD) != 0;
+#undef DS4_GLM_MTP_STAGE
+    ds4_gpu_tensor_free(enorm_view);
+    ds4_gpu_tensor_free(hnorm_view);
+    if (stage_out) *stage_out = mtp_stage;
+    return ok;
+}
+
+
+/* One MTP step at (absolute) position pos: consumes the main model's last
+ * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
+ * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
+ * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
+static bool glm_graph_mtp_step(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                next_token,
+        uint32_t           pos,
+        uint32_t           min_pos,
+        int               *draft_out) {
+    if (!g || !model || !weights || !draft_out) return false;
+    if (DS4_N_NEXTN_PREDICT == 0) return false;
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    if (pos >= cache_cap || min_pos > pos) {
+        fprintf(stderr, "ds4: glm mtp: pos %u/min %u out of range (cap %u)\n",
+                pos, min_pos, cache_cap);
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &weights->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_enorm || !l->nextn_hnorm ||
+        !l->nextn_shared_head_norm || !l->ffn_gate_exps) {
+        fprintf(stderr, "ds4: glm mtp: nextn weights missing at layer %u\n", il);
+        return false;
+    }
+    const uint32_t n_selected = pos - min_pos + 1u;
+    bool input_ready = false;
+
+    if (g->placement) {
+        const int embedding_tier = g->placement[0];
+        const int mtp_tier = g->placement[il + 1u];
+        bool handoff_ok = glm_graph_ws_switch(g, embedding_tier, true);
+        if (handoff_ok) handoff_ok = glm_graph_begin_commands_if_needed();
+        if (handoff_ok) {
+            handoff_ok = glm_graph_mtp_embed_token(g,
+                                                   model,
+                                                   weights,
+                                                   next_token,
+                                                   g->next);
+        }
+        if (handoff_ok) handoff_ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        ds4_gpu_tensor *embedded_next = handoff_ok ? g->next : NULL;
+        if (handoff_ok) handoff_ok = glm_graph_ws_switch(g, mtp_tier, true);
+        if (handoff_ok) {
+            handoff_ok = ds4_gpu_tensor_copy_async(
+                    g->next, embedded_next,
+                    (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+        }
+        if (!handoff_ok) {
+            fprintf(stderr, "ds4: glm mtp: multi-tier input handoff failed\n");
+            return false;
+        }
+        input_ready = true;
+    }
+    if (!glm_graph_mtp_ensure(g)) {
+        fprintf(stderr, "ds4: glm mtp: ensure failed (cap %u)\n", cache_cap);
+        return false;
+    }
+
+    /* Draft attention window: absolute cache slots [min_pos..pos]. */
+    {
+        int32_t *sel = malloc((size_t)n_selected * sizeof(int32_t));
+        if (!sel) return false;
+        for (uint32_t i = 0; i < n_selected; i++) sel[i] = (int32_t)(min_pos + i);
+        const int wr = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
+                                            (uint64_t)n_selected * sizeof(int32_t));
+        free(sel);
+        if (!wr) {
+            fprintf(stderr, "ds4: glm mtp: selected write failed (%u)\n", n_selected);
+            return false;
+        }
+    }
+
+    const char *mtp_stage = "begin";
+#define DS4_GLM_MTP_STAGE(name_) do { if (ok) mtp_stage = (name_); } while (0)
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok && !input_ready) {
+        ok = glm_graph_mtp_embed_token(g, model, weights, next_token, g->next);
+    }
+    if (ok) ok = glm_graph_mtp_encode_row(g, model, weights,
+                                          g->next,
+                                          g->glm53 ? g->hc_cur : g->cur,
+                                          g->glm53,
+                                          pos,
+                                          n_selected,
+                                          &mtp_stage);
+    if (ok && g->mtp_chain_hidden) {
+        ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+
     /* Shared output head behind the nextn head norm. */
     DS4_GLM_MTP_STAGE("head_norm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
@@ -51820,8 +52016,6 @@ static bool glm_graph_mtp_step(
                                  g->mtp_logits_host,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
-    ds4_gpu_tensor_free(enorm_view);
-    ds4_gpu_tensor_free(hnorm_view);
     if (!ok) {
         fprintf(stderr, "ds4: glm mtp step failed at stage '%s' (pos %u)\n",
                 mtp_stage, pos);
@@ -51839,6 +52033,187 @@ static bool glm_graph_mtp_step(
     *draft_out = best;
     return true;
 }
+
+/* GLM-5.3 nextn catch-up over n rows (1..3) in one command batch, like
+ * qwen4_graph_mtp_steps: row t consumes the trunk mHC row hc_rows[t] and
+ * next_tokens[t] at position pos + t and writes MTP cache slot pos + t.  Only
+ * the last row runs the output head; its argmax is the next draft. */
+static bool glm53_graph_mtp_rows(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *next_tokens,
+        const float       *hc_rows,
+        uint32_t           n,
+        uint32_t           pos,
+        uint32_t           min_pos,
+        int               *draft_out) {
+    if (!g || !g->glm53 || !model || !weights || !next_tokens || !hc_rows ||
+        !draft_out || n == 0 || n > 3u || g->placement) {
+        return false;
+    }
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    if (min_pos > pos || pos + n > cache_cap) return false;
+    if (!glm_graph_mtp_ensure(g) || !g->mtp_embed_rows || !g->mtp_hc_rows ||
+        !g->mtp_chain_hidden) {
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &weights->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_shared_head_norm) return false;
+    int32_t ids[3];
+    for (uint32_t t = 0; t < n; t++) {
+        if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
+        ids[t] = (int32_t)next_tokens[t];
+    }
+    /* Every row's window is a prefix of the last row's [min_pos..pos+n-1]. */
+    const uint32_t n_selected_last = pos + n - min_pos;
+    int32_t *sel = malloc((size_t)n_selected_last * sizeof(int32_t));
+    if (!sel) return false;
+    for (uint32_t i = 0; i < n_selected_last; i++) sel[i] = (int32_t)(min_pos + i);
+    bool ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
+                                   (uint64_t)n_selected_last * sizeof(int32_t)) != 0;
+    free(sel);
+    const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    /* Host writes land immediately: write every input before encoding. */
+    if (ok) ok = ds4_gpu_tensor_write(g->mtp_hc_rows, 0, hc_rows, n * hc_row_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, ids,
+                                      (uint64_t)n * sizeof(int32_t)) != 0;
+    const char *mtp_stage = "embed";
+    if (ok) ok = glm_graph_begin_commands_if_needed();
+    if (ok) {
+        ok = weights->token_embd->type == DS4_TENSOR_BF16 ?
+            ds4_gpu_glm53_embedding_bf16(g->mtp_embed_rows,
+                                         model->map,
+                                         model->size,
+                                         weights->token_embd->abs_offset,
+                                         g->prefill_tokens,
+                                         n,
+                                         DS4_N_EMBD,
+                                         DS4_N_VOCAB) != 0 :
+            ds4_gpu_embed_tokens_quant_tensor(g->mtp_embed_rows,
+                                              g->prefill_tokens,
+                                              model->map,
+                                              model->size,
+                                              weights->token_embd->abs_offset,
+                                              weights->token_embd->type,
+                                              DS4_N_VOCAB,
+                                              n,
+                                              DS4_N_EMBD) != 0;
+    }
+    for (uint32_t t = 0; ok && t < n; t++) {
+        ds4_gpu_tensor *e_row = ds4_gpu_tensor_view(g->mtp_embed_rows, t * emb_bytes, emb_bytes);
+        ds4_gpu_tensor *h_row = ds4_gpu_tensor_view(g->mtp_hc_rows, t * hc_row_bytes, hc_row_bytes);
+        ok = e_row && h_row &&
+             glm_graph_mtp_encode_row(g, model, weights, e_row, h_row, true,
+                                      pos + t, pos + t - min_pos + 1u, &mtp_stage);
+        ds4_gpu_tensor_free(h_row);
+        ds4_gpu_tensor_free(e_row);
+    }
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0, emb_bytes) != 0;
+    if (ok) mtp_stage = "head";
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                                g->next,
+                                                model->map,
+                                                model->size,
+                                                l->nextn_shared_head_norm->abs_offset,
+                                                DS4_N_EMBD,
+                                                DS4_RMS_EPS) != 0;
+    if (ok) ok = glm_graph_mtp_matmul(g, g->logits, model, weights->output,
+                                      DS4_N_EMBD, DS4_N_VOCAB, g->output_norm);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, g->mtp_logits_host,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: glm mtp rows failed at stage '%s' (pos %u, rows %u)\n",
+                mtp_stage, pos, n);
+        return false;
+    }
+    int best = 0;
+    float best_v = g->mtp_logits_host[0];
+    for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+        if (g->mtp_logits_host[i] > best_v) {
+            best_v = g->mtp_logits_host[i];
+            best = (int)i;
+        }
+    }
+    *draft_out = best;
+    return true;
+}
+
+/* Chained draft, like qwen4_graph_mtp_chain_step: one more nextn row at pos
+ * conditioned on the nextn block's own last output (g->mtp_chain_hidden)
+ * instead of a trunk row.  Writes MTP cache slot pos speculatively; the next
+ * catch-up overwrites it with the true trunk row. */
+static bool glm53_graph_mtp_chain(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        int                next_token,
+        uint32_t           pos,
+        uint32_t           min_pos,
+        int               *draft_out) {
+    if (!g || !g->glm53 || !model || !weights || !draft_out || g->placement) {
+        return false;
+    }
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    if (min_pos > pos || pos >= cache_cap) return false;
+    if (!glm_graph_mtp_ensure(g) || !g->mtp_chain_hidden) {
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &weights->layer[il];
+    if (!l->nextn_eh_proj || !l->nextn_shared_head_norm) return false;
+    const uint32_t n_selected = pos - min_pos + 1u;
+    int32_t *sel = malloc((size_t)n_selected * sizeof(int32_t));
+    if (!sel) return false;
+    for (uint32_t i = 0; i < n_selected; i++) sel[i] = (int32_t)(min_pos + i);
+    bool ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
+                                   (uint64_t)n_selected * sizeof(int32_t)) != 0;
+    free(sel);
+    const char *mtp_stage = "embed";
+    if (ok) ok = glm_graph_begin_commands_if_needed();
+    if (ok) ok = glm_graph_mtp_embed_token(g, model, weights, next_token, g->next);
+    if (ok) ok = glm_graph_mtp_encode_row(g, model, weights, g->next,
+                                         g->mtp_chain_hidden, false,
+                                         pos, n_selected, &mtp_stage);
+    if (ok && g->mtp_chain_hidden) {
+        ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    if (ok) mtp_stage = "head";
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                                g->next,
+                                                model->map,
+                                                model->size,
+                                                l->nextn_shared_head_norm->abs_offset,
+                                                DS4_N_EMBD,
+                                                DS4_RMS_EPS) != 0;
+    if (ok) ok = glm_graph_mtp_matmul(g, g->logits, model, weights->output,
+                                      DS4_N_EMBD, DS4_N_VOCAB, g->output_norm);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, g->mtp_logits_host,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    if (!ok) {
+        fprintf(stderr, "ds4: glm mtp chain failed at stage '%s' (pos %u)\n",
+                mtp_stage, pos);
+        return false;
+    }
+    int best = 0;
+    float best_v = g->mtp_logits_host[0];
+    for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
+        if (g->mtp_logits_host[i] > best_v) {
+            best_v = g->mtp_logits_host[i];
+            best = (int)i;
+        }
+    }
+    *draft_out = best;
+    return true;
+}
+
 
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
@@ -53680,8 +54055,12 @@ static bool glm_graph_forward_indexed_tokens(
 
     const bool use_all_scalar_kernels =
         n_tokens == 1u && glm_graph_indexed_prefill_scalar_kernels();
+    /* GLM 5.3 MTP verifies two or three rows per cycle.  The batch indexer scorer is
+     * built for prefill chunks: at two rows and long context it costs ~4x more
+     * per row than the decode scorer, so tiny chunks score row by row. */
     const bool use_scalar_indexer =
         use_all_scalar_kernels ||
+        (g->glm53 && n_tokens <= 3u && pos0 >= DS4_GLM53_ROW_INDEXER_MIN_POS) ||
         glm_graph_indexed_prefill_scalar_indexer() ||
         !glm_graph_indexed_prefill_batch_indexer();
     const bool force_scalar_attn =
@@ -54068,7 +54447,49 @@ static bool glm_graph_forward_indexed_tokens(
                         g->batch_attn_norm,
                         n_tokens);
             }
-            if (ok && g->glm53) {
+            if (ok && g->glm53 && g->mtp_snap_rows != 0 &&
+                n_tokens >= 2u && n_tokens <= 3u) {
+                /* Same per-row update as decode; snapshot the tail after
+                 * row 0 (and row 1) for the fast MTP cycle. */
+                const uint64_t row_bytes =
+                    (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                const uint64_t state_off = glm53_graph_spec_state_offset(g, il);
+                const uint64_t tail_bytes =
+                    ds4_gpu_tensor_bytes(g->layer_indexer_tail_k[il]);
+                for (uint32_t r = 0; ok && r < n_tokens; r++) {
+                    ds4_gpu_tensor *k_row = ds4_gpu_tensor_view(
+                            g->batch_indexer_k, r * row_bytes, row_bytes);
+                    ds4_gpu_tensor *gate_row = ds4_gpu_tensor_view(
+                            g->batch_indexer_gate, r * row_bytes, row_bytes);
+                    ok = k_row && gate_row;
+                    if (ok) ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                            g->layer_indexer_key_cache[il],
+                            g->layer_indexer_tail_k[il],
+                            g->layer_indexer_tail_gate[il],
+                            k_row,
+                            gate_row,
+                            model->map,
+                            model->size,
+                            l->indexer_k_norm->abs_offset,
+                            l->indexer_k_norm_b->abs_offset,
+                            l->indexer_compressor_ape->abs_offset,
+                            pos0 + r,
+                            1,
+                            g->compact_cache_cap,
+                            DS4_N_INDEXER_HEAD_DIM,
+                            DS4_GLM53_INDEX_POOL_SIZE,
+                            1.0e-6f,
+                            glm_graph_compact_cache_is_f16()) != 0;
+                    if (ok && r < g->mtp_snap_rows && r < 2u && g->mtp_state_row[r]) {
+                        ok = ds4_gpu_tensor_copy(g->mtp_state_row[r], state_off,
+                                                 g->layer_indexer_tail_k[il], 0,
+                                                 tail_bytes) != 0;
+                        if (ok) g->mtp_snap_captured++;
+                    }
+                    ds4_gpu_tensor_free(gate_row);
+                    ds4_gpu_tensor_free(k_row);
+                }
+            } else if (ok && g->glm53) {
                 ok = ds4_gpu_glm53_indexer_pool_update_tensor(
                         g->layer_indexer_key_cache[il],
                         g->layer_indexer_tail_k[il],
@@ -54237,10 +54658,21 @@ static bool glm_graph_forward_indexed_tokens(
                     /* The causal kernel consumes the implicit [0, visible)
                      * range directly; no selected-row buffer is needed. */
                 } else if (use_scalar_indexer) {
+                    /* Row t scores exactly what decode at pos0 + t scores.
+                     * GLM 5.3 scores complete pools only; the expansion below
+                     * maps pools to rows and adds the incomplete tail pool. */
                     const float indexer_scale =
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+                    const uint32_t row_selected = g->glm53 ?
+                        indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE :
+                        indexed_selected_count;
+                    ds4_gpu_tensor *selected_base = g->glm53 ?
+                        g->batch_indexer_pool_selected :
+                        g->batch_indexer_selected;
                     for (uint32_t t = 0; ok && t < n_tokens; t++) {
                         const uint32_t visible = pos0 + t + 1u;
+                        const uint32_t score_rows = g->glm53 ?
+                            visible / DS4_GLM53_INDEX_POOL_SIZE : visible;
                         ds4_gpu_tensor *indexer_q_view =
                             glm_graph_tensor_row_view_strided(
                                     g->batch_indexer_q,
@@ -54255,11 +54687,11 @@ static bool glm_graph_forward_indexed_tokens(
                         ds4_gpu_tensor *scores_view =
                             ds4_gpu_tensor_view(g->batch_indexer_scores,
                                                 0,
-                                                (uint64_t)visible * sizeof(float));
+                                                (uint64_t)score_rows * sizeof(float));
                         ds4_gpu_tensor *selected_view =
-                            ds4_gpu_tensor_view(g->batch_indexer_selected,
-                                                (uint64_t)t * indexed_selected_count * sizeof(uint32_t),
-                                                (uint64_t)indexed_selected_count * sizeof(uint32_t));
+                            ds4_gpu_tensor_view(selected_base,
+                                                (uint64_t)t * row_selected * sizeof(uint32_t),
+                                                (uint64_t)row_selected * sizeof(uint32_t));
                         ok = indexer_q_view && indexer_weights_view && scores_view && selected_view;
                         if (!ok) fprintf(stderr, "ds4: GLM scalar indexed prefill failed to create indexer row views at layer %u token %u\n", il, t);
                         if (ok) {
@@ -54268,7 +54700,7 @@ static bool glm_graph_forward_indexed_tokens(
                                              indexer_q_view,
                                              indexer_weights_view,
                                              g->layer_indexer_key_cache[il],
-                                             visible,
+                                             score_rows,
                                              DS4_N_INDEXER_HEAD,
                                              DS4_N_INDEXER_HEAD_DIM,
                                              indexer_scale,
@@ -54280,9 +54712,9 @@ static bool glm_graph_forward_indexed_tokens(
                         if (ok) {
                             int rc = ds4_gpu_indexer_topk_tensor(selected_view,
                                                                  scores_view,
-                                                                 visible,
+                                                                 score_rows,
                                                                  1,
-                                                                 indexed_selected_count);
+                                                                 row_selected);
                             ok = rc != 0;
                             if (!ok) fprintf(stderr, "ds4: GLM scalar indexed prefill topk failed at layer %u token %u\n", il, t);
                         }
@@ -54291,6 +54723,17 @@ static bool glm_graph_forward_indexed_tokens(
                         ds4_gpu_tensor_free(scores_view);
                         ds4_gpu_tensor_free(indexer_weights_view);
                         ds4_gpu_tensor_free(indexer_q_view);
+                    }
+                    if (ok && g->glm53) {
+                        ok = ds4_gpu_glm53_expand_pool_selection_tensor(
+                                g->batch_indexer_selected,
+                                g->batch_indexer_pool_selected,
+                                n_tokens,
+                                pos0,
+                                row_selected,
+                                indexer_top_k,
+                                DS4_GLM53_INDEX_POOL_SIZE,
+                                indexed_selected_count) != 0;
                     }
                 } else {
                     const float indexer_scale =
@@ -55159,7 +55602,54 @@ glm53_indexed_attention_done:
                                                                 model,
                                                                 weights);
     }
-    if (ok && logits_out) {
+    if (ok && logits_out && g->glm53 && g->mtp_rows_logits &&
+        n_tokens <= 3u && g->mtp_rows_hidden && g->mtp_rows_norm &&
+        g->mtp_rows_logits_gpu) {
+        /* Fast MTP verify: one output-head pass for every verify row. */
+        const uint64_t hidden_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t r = 0; ok && r < n_tokens; r++) {
+            ds4_gpu_tensor *hc_row = glm_graph_tensor_row_view_strided(
+                    hc_cur,
+                    r,
+                    (uint64_t)DS4_N_HC * DS4_N_EMBD,
+                    (uint64_t)DS4_N_HC * DS4_N_EMBD);
+            ds4_gpu_tensor *hidden_row = ds4_gpu_tensor_view(
+                    g->mtp_rows_hidden, r * hidden_bytes, hidden_bytes);
+            ok = hc_row && hidden_row &&
+                 ds4_gpu_hc_weighted_sum_tensor(hidden_row,
+                                                hc_row,
+                                                g->hc_mean_weights,
+                                                DS4_N_EMBD,
+                                                DS4_N_HC) != 0;
+            ds4_gpu_tensor_free(hidden_row);
+            ds4_gpu_tensor_free(hc_row);
+        }
+        if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mtp_rows_norm,
+                                                         g->mtp_rows_hidden,
+                                                         model->map,
+                                                         model->size,
+                                                         weights->output_norm->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         n_tokens,
+                                                         DS4_RMS_EPS) != 0;
+        if (ok) ok = glm53_graph_matmul_rows(g->mtp_rows_logits_gpu,
+                                             model,
+                                             weights->output,
+                                             DS4_N_EMBD,
+                                             DS4_N_VOCAB,
+                                             g->mtp_rows_norm,
+                                             n_tokens);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (ok) ok = ds4_gpu_tensor_read(g->mtp_rows_logits_gpu,
+                                         0,
+                                         g->mtp_rows_logits,
+                                         (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(float)) != 0;
+        if (ok) memcpy(logits_out,
+                       g->mtp_rows_logits + (size_t)(n_tokens - 1u) * DS4_N_VOCAB,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+    } else if (ok && logits_out) {
         if (g->glm53) {
             ds4_gpu_tensor *last_hc = glm_graph_tensor_row_view_strided(
                     hc_cur,
@@ -60381,6 +60871,15 @@ struct ds4_session {
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
+    float *glm53_verify_hc;          /* fast GLM-5.3 cycle: [3][hc][embd] verify rows */
+    float *glm53_verify_logits;      /* fast GLM-5.3 cycle: [3][vocab] verify logits */
+    uint32_t glm_mtp_rollback_n;     /* tokens the rollback cycle committed (2 or 3) */
+    bool glm_mtp_rollback_fast;      /* rollback restores the fast cycle's row snapshots */
+    bool glm_mtp_rollback_saved;     /* fast cycle saved the pre-verify state (exact sampling) */
+    uint32_t glm_depth_window;       /* GLM depth policy, same rules as qwen4_spec_depth */
+    uint32_t glm_depth_cycles;
+    uint32_t glm_reject2_streak;
+    bool glm_depth3_engaged;
     ds4_spec_frontier greedy_splitkv_anchor;
 #endif
     ds4_kv_cache cpu_cache;
@@ -73191,6 +73690,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 glm_graph_free(&s->glm_graph);
                 free(s->glm_mtp_hc);
                 free(s->glm_mtp_logits0);
+                free(s->glm53_verify_hc);
+                free(s->glm53_verify_logits);
                 free(s->logits);
                 free(s->sample_probs);
                 free(s);
@@ -73440,6 +73941,8 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
+    free(s->glm53_verify_hc);
+    free(s->glm53_verify_logits);
 #endif
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
@@ -73718,6 +74221,295 @@ static int speculative_point_replacement(ds4_session *s,
                                           int draft_token,
                                           uint64_t *rng);
 
+/* Draft depth policy for the GLM-5.3 fast cycle, the same rules as
+ * qwen4_spec_depth: DS4_GLM_MTP_DEPTH=2 or =3 fixes the depth; the default
+ * drafts a second chained token only while the last eight first drafts were
+ * all accepted, and drops back after the chained draft stops paying. */
+static int glm53_spec_depth(ds4_session *s) {
+    const char *env = getenv("DS4_GLM_MTP_DEPTH");
+    const int v = env && env[0] ? atoi(env) : 0;
+    if (v == 2 || v == 3) return v;
+    const uint32_t window = s->glm_depth_window & 255u;
+    uint32_t bits = 0;
+    for (uint32_t i = 0; i < 8u; i++) bits += (window >> i) & 1u;
+    if (!s->glm_depth3_engaged) {
+        if (bits >= 8u && s->glm_depth_cycles >= 8u && s->glm_reject2_streak == 0u) {
+            s->glm_depth3_engaged = true;
+        }
+    } else if (bits < 6u || s->glm_reject2_streak >= 2u) {
+        s->glm_depth3_engaged = false;
+    }
+    return s->glm_depth3_engaged ? 3 : 2;
+}
+
+static void glm53_spec_note_first_draft(ds4_session *s, bool accepted_first) {
+    s->glm_depth_window = (s->glm_depth_window << 1u) | (accepted_first ? 1u : 0u);
+    s->glm_depth_cycles++;
+}
+
+static bool glm53_fast_spec_supported(const ds4_session *s) {
+    const ds4_glm_gpu_graph *g = &s->glm_graph;
+    return g->glm53 && !g->full_kv_cache && !g->ssd_streaming &&
+           g->placement == NULL && g->tp_world < 2u &&
+           !s->engine->tp.active && g->layer_start == 0 &&
+           g->has_output_head && glm53_graph_use_indexed_prefill(g) &&
+           getenv("DS4_GLM_MTP_LEGACY") == NULL;
+}
+
+/* GLM-5.3 MTP cycle in the Qwen3.8 design (ds4_session_qwen4_spec_cycle):
+ * verify [first_token, draft] -- plus a chained second draft when the depth
+ * policy engages it -- in one 2- or 3-row pass that returns every row's logits
+ * and snapshots the recurrent state after row 0 (and row 1).  A rejected
+ * draft restores a snapshot instead of replaying decode; accepted rows catch
+ * the nextn block up in one batch.  Exact sampling always runs at depth 2. */
+static int ds4_session_glm53_fast_spec_cycle(
+        ds4_session *s, int first_token, int eos_token, float temperature,
+        int top_k, float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    const bool timing = e->glm_mtp_timing;
+    const uint32_t V = DS4_N_VOCAB;
+    const uint64_t hc_row_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    if (!s->glm53_verify_hc) {
+        s->glm53_verify_hc = malloc(3u * hc_row_values * sizeof(float));
+        s->glm53_verify_logits = malloc(3u * (size_t)V * sizeof(float));
+        if (!s->glm53_verify_hc || !s->glm53_verify_logits) {
+            if (errlen) snprintf(err, errlen, "glm mtp: out of memory");
+            return -1;
+        }
+    }
+    if (!glm_graph_mtp_ensure(g)) {
+        if (errlen) snprintf(err, errlen, "glm mtp: scratch alloc failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    int depth = exact_sampling ? 2 : glm53_spec_depth(s);
+    if (depth == 3 && !glm53_graph_mtp_ensure_row1(g)) depth = 2;
+    s->glm_mtp_rollback_valid = false;
+    if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
+    const uint32_t mtp_cap = glm_graph_mtp_cache_cap(g);
+    const bool deep = depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 &&
+        accepted_cap >= 3 && pos + 3u <= g->ctx_size &&
+        (g->compact_cache_cap == 0 || pos + 2u < g->compact_cache_cap) &&
+        pos + 4u <= mtp_cap;
+    if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_size ||
+        (g->compact_cache_cap != 0 && pos + 1u >= g->compact_cache_cap)) {
+        /* Plain step, then seed the drafts from g->hc_cur. */
+        s->glm_spec_inside = 1;
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        s->glm_spec_inside = 0;
+        if (rc != 0) return -1;
+        const int n1 = glm_session_logits_argmax(s->logits);
+        if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos) {
+            s->glm_mtp_min_pos = pos;
+        }
+        int d = -1;
+        s->glm_mtp_have = 0;
+        s->glm_mtp_have2 = false;
+        if (glm_graph_mtp_step(g, m, w, n1, pos, s->glm_mtp_min_pos, &d)) {
+            s->glm_mtp_draft = d;
+            s->glm_mtp_parent = n1;
+            s->glm_mtp_have = 1;
+            int d2 = -1;
+            if (depth == 3 && pos + 2u <= mtp_cap &&
+                glm53_graph_mtp_chain(g, m, w, d, pos + 1u, s->glm_mtp_min_pos, &d2)) {
+                s->glm_mtp_draft2 = d2;
+                s->glm_mtp_have2 = true;
+            }
+        }
+        accepted[0] = first_token;
+        return 1;
+    }
+
+    const double t0 = timing ? now_sec() : 0.0;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+    const int d = s->glm_mtp_draft;
+    const int d2 = deep ? s->glm_mtp_draft2 : -1;
+    const int toks[3] = { first_token, d, d2 };
+    const uint32_t T = deep ? 3u : 2u;
+    const uint32_t dense_before = s->glm_dense_cache_len;
+    /* Only exact sampling can rewind to the block start (server resample at a
+     * sampling-mode boundary); every other rewind lands on a row snapshot. */
+    const bool saved = exact_sampling && glm53_graph_copy_spec_state(g, true);
+    if (exact_sampling && !saved) {
+        if (errlen) snprintf(err, errlen, "glm mtp: state save failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    g->mtp_snap_rows = T - 1u;
+    g->mtp_snap_captured = 0;
+    g->mtp_rows_logits = s->glm53_verify_logits;
+    const bool verified = glm_graph_forward_indexed_tokens(
+            g, m, w, toks, NULL, NULL, 0, pos, T,
+            s->glm53_verify_hc, s->logits, NULL, NULL, pos, 0, T);
+    const uint32_t captured = g->mtp_snap_captured;
+    g->mtp_snap_rows = 0;
+    g->mtp_rows_logits = NULL;
+    const uint32_t want = (T - 1u) * glm53_graph_spec_state_layers(g);
+    if (!verified || captured != want) {
+        if (verified) {
+            fprintf(stderr, "ds4: glm mtp: verify captured %u of %u state snapshots\n",
+                    captured, want);
+        }
+        if (saved) (void)glm53_graph_copy_spec_state(g, false);
+        if (errlen) snprintf(err, errlen, "glm mtp: GLM 5.3 verify failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    const double t1 = timing ? now_sec() : 0.0;
+    const float *rows = s->glm53_verify_logits;
+    const uint32_t trunk_last = glm53_graph_trunk_last_layer(g);
+    const int n1 = glm_session_logits_argmax(rows);
+    bool accept = n1 == d;
+    const bool accept2 = deep && accept && glm_session_logits_argmax(rows + V) == d2;
+    int replacement = -1;
+    if (exact_sampling) {
+        if (!rng ||
+            !sample_build_probabilities(rows, V, temperature, top_k, top_p, min_p,
+                                        s->sample_probs)) {
+            (void)glm53_graph_copy_spec_state(g, false);
+            if (errlen) snprintf(err, errlen, "glm mtp: target distribution failed");
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        accept = speculative_point_accept(s->sample_probs[d], 1.0f, rng);
+        if (!accept) {
+            replacement = speculative_point_replacement(s, d, rng);
+            if (replacement < 0) {
+                (void)glm53_graph_copy_spec_state(g, false);
+                if (errlen) snprintf(err, errlen, "glm mtp: replacement sampling failed");
+                s->checkpoint_valid = false;
+                return -1;
+            }
+        }
+    }
+    glm53_spec_note_first_draft(s, accept);
+    if (deep) {
+        if (accept2) s->glm_reject2_streak = 0u;
+        else if (accept) s->glm_reject2_streak++;
+    }
+
+    token_vec_push(&s->checkpoint, first_token);
+    s->checkpoint_valid = true;
+    int n_committed = 1;
+    int mtp_tokens[3] = { -1, -1, -1 };
+    uint32_t mtp_n = 0;
+    int parent = -1;
+    bool ok = true;
+    if (accept && (!deep || accept2)) {
+        token_vec_push(&s->checkpoint, d);
+        if (deep) token_vec_push(&s->checkpoint, d2);
+        n_committed = (int)T;
+        ds4_session_glm_note_dense_cache(s, pos, T);
+        memcpy(s->logits, rows + (size_t)(T - 1u) * V, (size_t)V * sizeof(float));
+        parent = glm_session_logits_argmax(s->logits);
+        mtp_tokens[0] = d;
+        if (deep) {
+            mtp_tokens[1] = d2;
+            mtp_tokens[2] = parent;
+        } else {
+            mtp_tokens[1] = parent;
+        }
+        mtp_n = T;
+        accepted[0] = first_token;
+        accepted[1] = d;
+        if (deep) accepted[2] = d2;
+    } else if (accept) {
+        /* first draft accepted, second rejected: restore the row-1 snapshot */
+        ok = glm53_graph_copy_spec_state_buffer(g, g->mtp_state_row[1], false, trunk_last);
+        token_vec_push(&s->checkpoint, d);
+        n_committed = 2;
+        ds4_session_glm_note_dense_cache(s, pos, 2);
+        memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
+        parent = glm_session_logits_argmax(s->logits);
+        mtp_tokens[0] = d;
+        mtp_tokens[1] = parent;
+        mtp_n = 2;
+        accepted[0] = first_token;
+        accepted[1] = d;
+    } else {
+        ok = glm53_graph_copy_spec_state_buffer(g, g->mtp_state_row[0], false, trunk_last);
+        memcpy(s->logits, rows, (size_t)V * sizeof(float));
+        accepted[0] = first_token;
+        if (ok && replacement >= 0) {
+            /* the residual sample stands in for the draft: run it from the snapshot */
+            ok = glm_graph_forward_token(g, m, w, replacement, NULL, pos + 1u,
+                                         NULL, s->logits, false);
+            if (ok) {
+                token_vec_push(&s->checkpoint, replacement);
+                n_committed = 2;
+                ds4_session_glm_note_dense_cache(s, pos, 2);
+                accepted[1] = replacement;
+                const int next = glm_session_logits_argmax(s->logits);
+                int nd = -1;
+                if (replacement != eos_token &&
+                    glm_graph_mtp_step(g, m, w, next, pos + 1u, s->glm_mtp_min_pos, &nd)) {
+                    s->glm_mtp_draft = nd;
+                    s->glm_mtp_parent = next;
+                    s->glm_mtp_have = 1;
+                }
+            }
+        } else if (ok) {
+            ds4_session_glm_note_dense_cache(s, pos, 1);
+            parent = n1;
+            mtp_tokens[0] = n1;
+            mtp_n = 1;
+        }
+    }
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "glm mtp: rejection restore failed");
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    if (mtp_n != 0) {
+        int nd = -1;
+        if (glm53_graph_mtp_rows(g, m, w, mtp_tokens, s->glm53_verify_hc, mtp_n,
+                                 pos, s->glm_mtp_min_pos, &nd)) {
+            s->glm_mtp_draft = nd;
+            s->glm_mtp_parent = parent;
+            s->glm_mtp_have = 1;
+            int nd2 = -1;
+            if (depth == 3 && pos + mtp_n + 1u <= mtp_cap &&
+                glm53_graph_mtp_chain(g, m, w, nd, pos + mtp_n,
+                                      s->glm_mtp_min_pos, &nd2)) {
+                s->glm_mtp_draft2 = nd2;
+                s->glm_mtp_have2 = true;
+            }
+        }
+    }
+    if (timing) {
+        const double t2 = now_sec();
+        char *dt = ds4_token_text(e, d, NULL);
+        char *nt = ds4_token_text(e, n1, NULL);
+        fprintf(stderr,
+                "ds4: glm mtp cycle: verify%u %.1f ms, head+draft %.1f ms, %s "
+                "(draft %d '%s' vs true %d '%s')\n",
+                T, (t1 - t0) * 1000.0, (t2 - t1) * 1000.0,
+                accept ? (deep ? (accept2 ? "ACCEPT3" : "ACCEPT_REJECT2") :
+                                 (exact_sampling ? "EXACT_ACCEPT" : "ACCEPT")) :
+                         (exact_sampling ? "exact_reject" : "reject"),
+                d, dt ? dt : "?", n1, nt ? nt : "?");
+        free(dt);
+        free(nt);
+    }
+    if (n_committed >= 2) {
+        s->glm_mtp_rollback_pos = pos;
+        s->glm_mtp_rollback_dense_len = dense_before;
+        s->glm_mtp_rollback_first_token = first_token;
+        s->glm_mtp_rollback_n = (uint32_t)n_committed;
+        s->glm_mtp_rollback_fast = true;
+        s->glm_mtp_rollback_saved = saved;
+        s->glm_mtp_rollback_valid = true;
+    }
+    return n_committed;
+}
+
+
 /* One GLM MTP speculative cycle: evaluate first_token, and when a compatible
  * pending draft exists verify [first_token, draft] in one 2-row batch pass
  * (big gates only under TP).  Greedy and opportunistic sampling accept a draft
@@ -73739,6 +74531,13 @@ static int ds4_session_glm_spec_cycle_impl(
         int          accepted_cap,
         char        *err,
         size_t       errlen) {
+    if (glm53_fast_spec_supported(s)) {
+        return ds4_session_glm53_fast_spec_cycle(s, first_token, eos_token,
+                                                 temperature, top_k, top_p,
+                                                 min_p, rng, exact_sampling,
+                                                 accepted, accepted_cap,
+                                                 err, errlen);
+    }
     ds4_engine *e = s->engine;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
@@ -74057,6 +74856,9 @@ static int ds4_session_glm_spec_cycle_impl(
         s->glm_mtp_rollback_dense_len = dense_before;
         s->glm_mtp_rollback_first_token = first_token;
         s->glm_mtp_rollback_valid = true;
+        s->glm_mtp_rollback_n = 2;
+        s->glm_mtp_rollback_fast = false;
+        s->glm_mtp_rollback_saved = true;
     }
     return n_committed;
 }
@@ -74066,12 +74868,35 @@ static int ds4_session_glm_spec_cycle_impl(
  * this when a speculative block crosses into or out of greedy tool syntax. */
 static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     if (!s || !s->glm_mtp_rollback_valid || !s->glm_graph.glm53 ||
-        s->checkpoint.len != (int)s->glm_mtp_rollback_pos + 2 ||
-        (pos != (int)s->glm_mtp_rollback_pos &&
-         pos != (int)s->glm_mtp_rollback_pos + 1)) {
+        s->checkpoint.len != (int)(s->glm_mtp_rollback_pos + s->glm_mtp_rollback_n) ||
+        pos < (int)s->glm_mtp_rollback_pos ||
+        pos >= (int)(s->glm_mtp_rollback_pos + s->glm_mtp_rollback_n)) {
         return false;
     }
     const uint32_t start = s->glm_mtp_rollback_pos;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (s->glm_mtp_rollback_fast) {
+        /* Row snapshots hold the state after row 0 / row 1 of the verify. */
+        const uint32_t keep = (uint32_t)pos - start;
+        const uint32_t trunk_last = glm53_graph_trunk_last_layer(g);
+        bool ok = false;
+        if (keep == 1u || keep == 2u) {
+            ok = glm53_graph_copy_spec_state_buffer(g, g->mtp_state_row[keep - 1u],
+                                                    false, trunk_last);
+            if (ok) memcpy(s->logits,
+                           s->glm53_verify_logits + (size_t)(keep - 1u) * DS4_N_VOCAB,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+        } else if (keep == 0u && s->glm_mtp_rollback_saved) {
+            /* the caller re-evaluates the boundary token */
+            ok = glm53_graph_copy_spec_state(g, false);
+        }
+        s->glm_dense_cache_len = s->glm_mtp_rollback_dense_len;
+        if (ok && keep != 0u) ds4_session_glm_note_dense_cache(s, start, keep);
+        s->glm_mtp_rollback_valid = false;
+        s->glm_mtp_have = 0;
+        s->glm_mtp_have2 = false;
+        return ok;
+    }
     bool ok = glm53_graph_copy_spec_state(&s->glm_graph, false);
     s->glm_dense_cache_len = s->glm_mtp_rollback_dense_len;
     if (ok && pos == (int)start + 1) {
