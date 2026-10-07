@@ -7700,6 +7700,253 @@ static void test_glm_mtp_verify(void) {
     ds4_tokens_free(&prompt);
 }
 
+/* GLM 5.3 MTP draft window: the nextn KV cache is written only by decode and
+ * speculative steps, so prompt prefill leaves those positions unwritten.  Every
+ * request must therefore draft over a window that starts at its own first
+ * generated position.  The rolling minimum this replaced kept the first
+ * request's start for the whole session, so each turn lengthened the window
+ * until drafting broke.  Checks a fresh prompt, a resumed-checkpoint
+ * continuation and a disk-KV restore, and -- like --glm-mtp-verify -- that every
+ * committed token is the plain-decode argmax.  Needs a GLM 5.3 model and
+ * DS4_TEST_GLM_MTP=1. */
+#define TEST_GLM_MTP_WINDOW_MIN_TOKENS 32
+
+/* One greedy MTP request on an already-synced session: commits tokens with the
+ * speculative argmax path and returns how many (or -1 on failure). */
+static int test_glm_mtp_window_generate(ds4_engine *engine, ds4_session *session,
+                                        int max_tokens, int *out,
+                                        int *max_chunk, int *single_cycles) {
+    char err[192] = {0};
+    const int eos = ds4_token_eos(engine);
+    int n = 0;
+    *max_chunk = 0;
+    *single_cycles = 0;
+    while (n < max_tokens) {
+        const int first = ds4_session_argmax(session);
+        if (first < 0 || first == eos) break;
+        int accepted[4] = {0};
+        const int ntok = ds4_session_eval_speculative_argmax(
+            session, first, max_tokens - n, eos, accepted,
+            (int)(sizeof(accepted) / sizeof(accepted[0])), err, sizeof(err));
+        if (ntok < 1) {
+            fprintf(stderr, "ds4-test: glm-mtp-window cycle failed: %s\n", err);
+            TEST_ASSERT(false);
+            return -1;
+        }
+        if (ntok > *max_chunk) *max_chunk = ntok;
+        if (ntok == 1) (*single_cycles)++;
+        for (int i = 0; i < ntok; i++) {
+            if (accepted[i] == eos) return n;
+            out[n++] = accepted[i];
+            if (n >= max_tokens) return n;
+        }
+    }
+    return n;
+}
+
+/* The window start must be decided and be this request's first generated
+ * position.  Without the fix the resumed request reports the previous
+ * request's start, so a value mismatch is the regression signal. */
+static void test_glm_mtp_window_expect(ds4_session *session, const char *label,
+                                       uint32_t want) {
+    uint32_t start = 0;
+    const bool decided = ds4_session_glm_mtp_window_start(session, &start);
+    if (!decided || start != want) {
+        fprintf(stderr, "ds4-test: glm-mtp-window %s window start %s (want %u)\n",
+                label, decided ? "differs" : "undecided", want);
+    }
+    TEST_ASSERT(decided);
+    TEST_ASSERT(start == want);
+}
+
+/* At a request boundary the start must be re-decided, not inherited. */
+static void test_glm_mtp_window_expect_undecided(ds4_session *session,
+                                                 const char *label) {
+    uint32_t start = 0;
+    if (ds4_session_glm_mtp_window_start(session, &start)) {
+        fprintf(stderr,
+                "ds4-test: glm-mtp-window %s kept window start %u across the "
+                "request boundary\n", label, start);
+    }
+    uint32_t probe = 0;
+    TEST_ASSERT(!ds4_session_glm_mtp_window_start(session, &probe));
+}
+
+/* The sync must take the resumed-checkpoint branch: the session's own tokens
+ * are the new prompt's prefix and the prompt is longer than the checkpoint. */
+static bool test_glm_mtp_window_is_prefix(const ds4_tokens *history,
+                                          const ds4_tokens *prompt) {
+    if (!history || history->len <= 0 || history->len > prompt->len) return false;
+    for (int i = 0; i < history->len; i++) {
+        if (prompt->v[i] != history->v[i]) return false;
+    }
+    return true;
+}
+
+static void test_glm_mtp_window_verify(ds4_engine *engine,
+                                       const ds4_tokens *prompt, const int *toks,
+                                       int n, const char *label) {
+    float worst_gap = 0.0f;
+    int worst_at = -1;
+    TEST_ASSERT(test_mtp_worst_argmax_gap(engine, prompt, toks, n,
+                                          &worst_gap, &worst_at));
+    fprintf(stderr,
+            "ds4-test: glm-mtp-window %s prompt=%d tokens=%d worst_argmax_gap=%.3f "
+            "at=%d\n", label, prompt->len, n, worst_gap, worst_at);
+    TEST_ASSERT(worst_gap <= 2.0f);
+}
+
+static void test_glm_mtp_request_window(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-window skipped (needs a GLM 5.3 model "
+                        "and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+
+    int max_gen = (int)test_env_u32("DS4_TEST_GLM_MTP_WINDOW_TOKENS");
+    if (max_gen < TEST_GLM_MTP_WINDOW_MIN_TOKENS) {
+        max_gen = TEST_GLM_MTP_WINDOW_MIN_TOKENS * 2;
+    }
+    int ctx = (int)test_env_u32("DS4_TEST_GLM_MTP_WINDOW_CTX");
+    if (ctx < 4096) ctx = 4096;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens second = {0};
+    ds4_tokens third = {0};
+    ds4_session *live = NULL;
+    ds4_session *restored = NULL;
+    int *gen1 = malloc((size_t)max_gen * sizeof(*gen1));
+    int *gen2 = malloc((size_t)max_gen * sizeof(*gen2));
+    int *gen3 = malloc((size_t)max_gen * sizeof(*gen3));
+    char err[192] = {0};
+    uint32_t want1 = 0, want2 = 0, want3 = 0;
+    int n1 = -1, n2 = -1, n3 = -1;
+    int chunk1 = 0, chunk2 = 0, chunk3 = 0;
+    int single1 = 0, single2 = 0, single3 = 0;
+    FILE *payload = NULL;
+    long payload_bytes = 0;
+    TEST_ASSERT(gen1 != NULL && gen2 != NULL && gen3 != NULL);
+    if (!gen1 || !gen2 || !gen3) goto cleanup;
+
+    /* Request 1: a fresh prompt prefill writes no nextn KV, so the window
+     * starts at the first generated position. */
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    TEST_ASSERT(prompt.len + max_gen + 64 < ctx);
+    TEST_ASSERT(ds4_session_create(&live, engine, ctx) == 0);
+    if (!live) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+    test_glm_mtp_window_expect_undecided(live, "request 1 before generating");
+    want1 = (uint32_t)ds4_session_pos(live);
+    n1 = test_glm_mtp_window_generate(engine, live, max_gen, gen1, &chunk1, &single1);
+    TEST_ASSERT(n1 >= TEST_GLM_MTP_WINDOW_MIN_TOKENS);
+    if (n1 < TEST_GLM_MTP_WINDOW_MIN_TOKENS) goto cleanup;
+    TEST_ASSERT(chunk1 >= 2);  /* a draft was accepted: the MTP cycle really ran */
+    test_glm_mtp_window_expect(live, "request 1", want1);
+    test_glm_mtp_window_verify(engine, &prompt, gen1, n1, "request 1");
+
+    /* Request 2: the same session continues with a new user turn, so sync
+     * resumes the checkpoint and appends tokens that have no nextn KV. */
+    for (int i = 0; i < prompt.len; i++) ds4_tokens_push(&second, prompt.v[i]);
+    for (int i = 0; i < n1; i++) ds4_tokens_push(&second, gen1[i]);
+    {
+        buf followup = {0};
+        buf_puts(&followup, "Now reproduce only the first function again, exactly. ");
+        for (int i = 0; i < 8; i++) {
+            buf_puts(&followup, "Keep the formatting identical to the code block. ");
+        }
+        ds4_chat_append_message(engine, &second, "user",
+                               followup.ptr ? followup.ptr : "Again, exactly.");
+        buf_free(&followup);
+    }
+    ds4_chat_append_assistant_prefix(engine, &second, DS4_THINK_NONE);
+    const ds4_tokens *history = ds4_session_tokens(live);
+    TEST_ASSERT(history != NULL);
+    TEST_ASSERT(ds4_session_checkpoint_valid(live));
+    TEST_ASSERT(test_glm_mtp_window_is_prefix(history, &second));
+    TEST_ASSERT(second.len > (history ? history->len : 0));
+    TEST_ASSERT(second.len + max_gen + 64 < ctx);
+    TEST_ASSERT(ds4_session_sync(live, &second, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(live) == second.len);
+    test_glm_mtp_window_expect_undecided(live, "request 2 before generating");
+    want2 = (uint32_t)ds4_session_pos(live);
+    n2 = test_glm_mtp_window_generate(engine, live, max_gen, gen2, &chunk2, &single2);
+    TEST_ASSERT(n2 >= TEST_GLM_MTP_WINDOW_MIN_TOKENS);
+    if (n2 < TEST_GLM_MTP_WINDOW_MIN_TOKENS) goto cleanup;
+    test_glm_mtp_window_expect(live, "request 2", want2);
+    TEST_ASSERT(want2 != want1);
+    test_glm_mtp_window_verify(engine, &second, gen2, n2, "request 2");
+
+    /* Disk KV read-back: the payload carries the transcript and the KV, but
+     * the draft window always starts over for the next request. */
+    payload = tmpfile();
+    TEST_ASSERT(payload != NULL);
+    if (!payload) goto cleanup;
+    TEST_ASSERT(ds4_session_save_payload(live, payload, err, sizeof(err)) == 0);
+    payload_bytes = ftell(payload);
+    TEST_ASSERT(payload_bytes > 0);
+    fflush(payload);
+    rewind(payload);
+    ds4_session_free(live);
+    live = NULL;
+    TEST_ASSERT(ds4_session_create(&restored, engine, ctx) == 0);
+    if (!restored) goto cleanup;
+    TEST_ASSERT(ds4_session_load_payload(restored, payload, (uint64_t)payload_bytes,
+                                        err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_checkpoint_valid(restored));
+    TEST_ASSERT(ds4_session_pos(restored) == second.len + n2);
+    test_glm_mtp_window_expect_undecided(restored, "request 3 before generating");
+
+    for (int i = 0; i < second.len; i++) ds4_tokens_push(&third, second.v[i]);
+    for (int i = 0; i < n2; i++) ds4_tokens_push(&third, gen2[i]);
+    {
+        buf followup = {0};
+        buf_puts(&followup, "Now reproduce only the second function again, exactly. ");
+        for (int i = 0; i < 8; i++) {
+            buf_puts(&followup, "Keep the formatting identical to the code block. ");
+        }
+        ds4_chat_append_message(engine, &third, "user",
+                               followup.ptr ? followup.ptr : "Again, exactly.");
+        buf_free(&followup);
+    }
+    ds4_chat_append_assistant_prefix(engine, &third, DS4_THINK_NONE);
+    const ds4_tokens *restored_history = ds4_session_tokens(restored);
+    TEST_ASSERT(test_glm_mtp_window_is_prefix(restored_history, &third));
+    TEST_ASSERT(third.len > (restored_history ? restored_history->len : 0));
+    TEST_ASSERT(third.len + max_gen + 64 < ctx);
+    TEST_ASSERT(ds4_session_sync(restored, &third, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(restored) == third.len);
+    test_glm_mtp_window_expect_undecided(restored, "request 3 after syncing");
+    want3 = (uint32_t)ds4_session_pos(restored);
+    n3 = test_glm_mtp_window_generate(engine, restored, max_gen, gen3, &chunk3, &single3);
+    TEST_ASSERT(n3 >= TEST_GLM_MTP_WINDOW_MIN_TOKENS);
+    if (n3 < TEST_GLM_MTP_WINDOW_MIN_TOKENS) goto cleanup;
+    test_glm_mtp_window_expect(restored, "request 3", want3);
+    TEST_ASSERT(want3 != want2 && want3 != want1);
+    test_glm_mtp_window_verify(engine, &third, gen3, n3, "request 3");
+
+    fprintf(stderr,
+            "ds4-test: glm-mtp-window starts=%u/%u/%u prompt=%d/%d/%d tokens=%d/%d/%d "
+            "max_chunk=%d/%d/%d single_cycles=%d/%d/%d payload=%ld\n",
+            want1, want2, want3, prompt.len, second.len, third.len,
+            n1, n2, n3, chunk1, chunk2, chunk3, single1, single2, single3,
+            payload_bytes);
+
+cleanup:
+    if (payload) fclose(payload);
+    free(gen3);
+    free(gen2);
+    free(gen1);
+    ds4_tokens_free(&third);
+    ds4_tokens_free(&second);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(restored);
+    ds4_session_free(live);
+}
+
 /* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
  * is separate from the fixture because it teacher-forces every committed token
  * through normal decode and directly checks that DSpark never commits a token
@@ -7796,6 +8043,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
+    {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP drafts from the current request's first generated position after a resume or a disk-KV restore", test_glm_mtp_request_window},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
@@ -7832,6 +8080,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_TOKENS=N      Tokens to generate in --glm-mtp-verify. Default: 256.");
     puts("  DS4_TEST_GLM_MTP_DUMP=FILE     Write the committed token ids from --glm-mtp-verify.");
     puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Widest commit --glm-mtp-verify expects (2, or 3 with DS4_GLM_MTP_DEPTH=3). Default: 2.");
+    puts("  DS4_TEST_GLM_MTP_WINDOW_TOKENS=N  Tokens to generate per request in --glm-mtp-window. Default: 64.");
+    puts("  DS4_TEST_GLM_MTP_WINDOW_CTX=N     Session context for --glm-mtp-window. Default: 4096.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");

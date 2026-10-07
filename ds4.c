@@ -60963,7 +60963,13 @@ struct ds4_session {
     uint32_t glm_mtp_rollback_dense_len;
     int glm_mtp_rollback_first_token;
     int glm_spec_inside;
+    /* MTP draft attention window start (absolute position) for the request
+     * that is generating now.  The nextn KV cache only holds positions this
+     * request produced, so the start is decided at the request's first plain
+     * MTP step and never moves inside the request.  Position 0 is a legal
+     * start, so validity is tracked separately from the value. */
     uint32_t glm_mtp_min_pos;
+    bool glm_mtp_min_pos_valid;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     float *glm53_verify_hc;          /* fast GLM-5.3 cycle: [3][hc][embd] verify rows */
@@ -61973,13 +61979,33 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
 }
 
 #ifndef DS4_NO_GPU
+/* A new request starts generating on this session.  Whatever draft the
+ * previous request left over was conditioned on history the new request
+ * extends, and the appended prompt tokens never wrote the nextn cache, so the
+ * draft window start is dropped: it is re-decided at this request's first
+ * plain MTP step (see ds4_session_glm_note_mtp_window_start). */
+static void ds4_session_glm_new_request(ds4_session *s) {
+    if (!s) return;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+    s->glm_mtp_min_pos = 0;
+    s->glm_mtp_min_pos_valid = false;
+}
+
+/* First plain MTP step of the request: its position is the first position
+ * whose nextn KV exists, so it becomes the draft window start.  Later steps
+ * and depth switches of the same request keep it, forward or backward. */
+static void ds4_session_glm_note_mtp_window_start(ds4_session *s, uint32_t pos) {
+    if (!s || s->glm_mtp_min_pos_valid) return;
+    s->glm_mtp_min_pos = pos;
+    s->glm_mtp_min_pos_valid = true;
+}
+
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (!s) return;
     s->glm_dense_cache_len = 0;
-    s->glm_mtp_have = 0;
-    s->glm_mtp_have2 = false;
+    ds4_session_glm_new_request(s);
     s->glm_mtp_rollback_valid = false;
-    s->glm_mtp_min_pos = 0;
 }
 
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
@@ -74399,9 +74425,7 @@ static int ds4_session_glm53_fast_spec_cycle(
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
         const int n1 = glm_session_logits_argmax(s->logits);
-        if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos) {
-            s->glm_mtp_min_pos = pos;
-        }
+        ds4_session_glm_note_mtp_window_start(s, pos);
         int d = -1;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
@@ -74662,9 +74686,7 @@ static int ds4_session_glm_spec_cycle_impl(
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
         const int n1 = glm_session_logits_argmax(s->logits);
-        if (s->glm_mtp_min_pos == 0 || s->glm_mtp_min_pos > pos) {
-            s->glm_mtp_min_pos = pos;
-        }
+        ds4_session_glm_note_mtp_window_start(s, pos);
         int d = -1;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
@@ -76564,6 +76586,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             start = s->checkpoint.len;
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
+            /* A resumed checkpoint is still a new request: the prompt tokens
+             * appended below have no nextn KV, so the draft window must not
+             * reach back to the previous request's start. */
+            ds4_session_glm_new_request(s);
         } else {
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
@@ -86269,6 +86295,11 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
+    if (s->glm_mtp_min_pos_valid && (uint32_t)pos < s->glm_mtp_min_pos) {
+        /* Nothing left of the draft window: re-decide it at the next plain
+         * step instead of leaving min_pos above the running position. */
+        s->glm_mtp_min_pos_valid = false;
+    }
     ds4_session_glm_cap_dense_cache(s);
 #endif
 }
@@ -86279,6 +86310,18 @@ int ds4_session_pos(ds4_session *s) {
 
 bool ds4_session_checkpoint_valid(const ds4_session *s) {
     return s && s->checkpoint_valid;
+}
+
+bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->glm_mtp_min_pos_valid || !start_out) return false;
+    *start_out = s->glm_mtp_min_pos;
+    return true;
+#else
+    (void)s;
+    (void)start_out;
+    return false;
+#endif
 }
 
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {

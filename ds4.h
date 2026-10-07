@@ -483,6 +483,10 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Test helpers (ds4-test): GLM MTP draft attention window start for the request
+ * that is generating now.  Returns false while the start is undecided (no
+ * plain MTP step has run since the request began); position 0 is a valid start. */
+bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
