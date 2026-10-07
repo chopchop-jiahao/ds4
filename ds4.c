@@ -44162,6 +44162,15 @@ static float sample_rng_f32(uint64_t *state) {
     return (float)((x >> 40) & 0xffffffu) / 16777216.0f;
 }
 
+/* GLM-5.3 nextn (MTP) cache slot bookkeeping (ticket 005).  The ledger records
+ * what every write put into a slot; a chained draft row records a hidden
+ * position no position can have, because its slot is not covered by the
+ * "(token[p+1], hidden[p])" invariant.  mtp_write_failed uses NO_SLOT for
+ * "nothing failed". */
+#define DS4_GLM_MTP_LEDGER_NONE  0xFFFFFFFFu
+#define DS4_GLM_MTP_LEDGER_CHAIN 0xFFFFFFFEu
+#define DS4_GLM_MTP_NO_SLOT      0xFFFFFFFFu
+
 typedef struct {
     int id;
     float logit;
@@ -45241,8 +45250,27 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_seam_hidden;       /* [embd] */
     ds4_gpu_tensor *mtp_seam_token;        /* [1] int32, host-written */
     uint32_t        mtp_seam_pos;
+    /* What the checkpoint's last nextn slot holds (ticket 005).  The slot is
+     * written before its next token exists, so it carries the token the
+     * drafter guessed: mtp_seam_written is that token, or -1 when the slot has
+     * never been written.  mtp_seam_valid says whether mtp_seam_hidden still
+     * holds the slot's own post-norm hidden, which is the other half of what a
+     * rewrite with the real token needs.  Together the three describe the
+     * last position for every path that moves the checkpoint. */
+    int32_t         mtp_seam_written;
     bool            mtp_seam_valid;
-    bool            mtp_seam_unwritten;    /* slot mtp_seam_pos has never been written */
+    /* Test hooks (ticket 005), inert until a test turns them on: a per-slot
+     * ledger of every nextn cache write, a one-shot write-failure injection
+     * and the counters behind both.  The ledger is the only allocation here
+     * and only the test hook allocates it. */
+    uint32_t       *mtp_ledger_token;      /* [mtp_ledger_cap] or NULL */
+    uint32_t       *mtp_ledger_hidden;     /* [mtp_ledger_cap] or NULL */
+    uint32_t        mtp_ledger_cap;
+    int             mtp_fail_kind;         /* DS4_TEST_GLM_MTP_FAIL_* pending */
+    uint32_t        mtp_stat_rewrite;      /* rewrites a differing token caused */
+    uint32_t        mtp_stat_replacement;  /* exact-sampling replacement writes */
+    uint32_t        mtp_stat_failed;       /* failed nextn slot writes */
+    uint32_t        mtp_write_failed;      /* highest failed slot, or none */
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -47102,6 +47130,12 @@ static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_fill_indexer_k);
     ds4_gpu_tensor_free(g->mtp_fill_indexer_gate);
     free(g->mtp_logits_host);
+    /* The ticket-005 ledger is the one test-only allocation here. */
+    free(g->mtp_ledger_token);
+    free(g->mtp_ledger_hidden);
+    g->mtp_ledger_token = NULL;
+    g->mtp_ledger_hidden = NULL;
+    g->mtp_ledger_cap = 0;
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
     g->mtp_concat = NULL;
@@ -47121,6 +47155,9 @@ static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     g->mtp_indexer_key_cache = NULL;
     g->mtp_seam_hidden = NULL;
     g->mtp_seam_token = NULL;
+    g->mtp_ledger_token = NULL;
+    g->mtp_ledger_hidden = NULL;
+    g->mtp_ledger_cap = 0;
     g->mtp_fill_tokens = NULL;
     g->mtp_fill_embed = NULL;
     g->mtp_fill_hidden = NULL;
@@ -47141,7 +47178,7 @@ static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     g->mtp_indexer_store = 0;
     g->mtp_seam_pos = 0;
     g->mtp_seam_valid = false;
-    g->mtp_seam_unwritten = false;
+    g->mtp_seam_written = -1;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
 }
@@ -51722,8 +51759,9 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     g->mtp_fill_next = NULL;
     g->mtp_seam_save = false;
     g->mtp_seam_valid = false;
-    g->mtp_seam_unwritten = false;
+    g->mtp_seam_written = -1;
     g->mtp_seam_pos = 0;
+    g->mtp_write_failed = DS4_GLM_MTP_NO_SLOT;
     g->mtp_ready = 1;
     return true;
 }
@@ -52187,14 +52225,64 @@ static bool glm_graph_mtp_encode_row(
 
 
 /* Park one row's post-norm trunk hidden in the seam slot (defined with the
- * nextn fill helpers below). */
+ * nextn fill helpers below).  written_token is the token the slot holds after
+ * this call, or -1 when it has never been written. */
 static bool glm53_graph_mtp_seam_store(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
         const ds4_weights *weights,
         ds4_gpu_tensor    *hc_row,
         uint32_t           pos,
-        bool               slot_unwritten);
+        int32_t            written_token);
+
+/* Ticket 005 test hooks.  A test arms one injection, asks for the ledger, and
+ * reads the counters back; with the ledger unallocated and no injection armed
+ * a nextn write costs exactly what it cost before. */
+static bool glm53_graph_mtp_fail_take(ds4_glm_gpu_graph *g, int kind) {
+    if (!g || g->mtp_fail_kind != kind) return false;
+    g->mtp_fail_kind = 0;
+    return true;
+}
+
+/* A nextn slot write failed, so [0..pos_last] is no longer trustworthy for a
+ * draft.  Chained draft rows are the exception: they sit at or past
+ * checkpoint.len and the next plain step or catch-up overwrites them before
+ * anything reads them, so they only bump the counter. */
+static void glm53_graph_mtp_note_write_failed(ds4_glm_gpu_graph *g,
+                                              uint32_t           pos_last,
+                                              bool               chain) {
+    if (!g) return;
+    g->mtp_stat_failed++;
+    if (chain) return;
+    if (g->mtp_write_failed == DS4_GLM_MTP_NO_SLOT ||
+        pos_last > g->mtp_write_failed) {
+        g->mtp_write_failed = pos_last;
+    }
+}
+
+/* Record what a write put into slots [pos0 .. pos0+n-1]: the token it used and
+ * the absolute position of the trunk hidden it used. */
+static void glm53_graph_mtp_ledger_rows(ds4_glm_gpu_graph *g,
+                                        uint32_t           pos0,
+                                        uint32_t           n,
+                                        const int         *tokens,
+                                        uint32_t           hidden0) {
+    if (!g || !g->mtp_ledger_token || !tokens) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t p = pos0 + i;
+        if (p >= g->mtp_ledger_cap) return;
+        g->mtp_ledger_token[p] = (uint32_t)tokens[i];
+        g->mtp_ledger_hidden[p] = hidden0 + i;
+    }
+}
+
+static void glm53_graph_mtp_ledger_chain(ds4_glm_gpu_graph *g,
+                                         uint32_t           pos,
+                                         int                token) {
+    if (!g || !g->mtp_ledger_token || pos >= g->mtp_ledger_cap) return;
+    g->mtp_ledger_token[pos] = (uint32_t)token;
+    g->mtp_ledger_hidden[pos] = DS4_GLM_MTP_LEDGER_CHAIN;
+}
 
 
 /* One MTP step at (absolute) position pos: consumes the main model's last
@@ -52217,6 +52305,11 @@ static bool glm_graph_mtp_step(
     if (pos >= cache_cap || min_pos > pos) {
         fprintf(stderr, "ds4: glm mtp: pos %u/min %u out of range (cap %u)\n",
                 pos, min_pos, cache_cap);
+        return false;
+    }
+    if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_STEP)) {
+        fprintf(stderr, "ds4: glm mtp step failed at stage 'inject' (pos %u)\n", pos);
+        glm53_graph_mtp_note_write_failed(g, pos, false);
         return false;
     }
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
@@ -52320,17 +52413,16 @@ static bool glm_graph_mtp_step(
          * next token as soon as one exists. */
         g->mtp_seam_save = false;
         if (!glm53_graph_mtp_seam_store(g, model, weights, g->hc_cur, pos,
-                                        false)) {
+                                        (int32_t)next_token)) {
             fprintf(stderr, "ds4: glm mtp: seam save at pos %u failed\n", pos);
         }
     }
-    if (ok && g->glm53 && g->mtp_seam_valid && g->mtp_seam_pos == pos) {
+    if (ok && g->glm53 && g->mtp_seam_pos == pos) {
         /* encode_row above wrote this step's slot with the decode kernels, so
          * the seam parked at this position is no longer a row prefill left
-         * unwritten.  Only a never-written seam row is worth a batched rewrite
-         * on the next request; leaving the flag set would spend one on a slot
-         * this very step just filled. */
-        g->mtp_seam_unwritten = false;
+         * unwritten: it holds next_token, the token this step guessed.  Only a
+         * slot holding some other token is worth a rewrite later. */
+        g->mtp_seam_written = next_token;
     }
     DS4_GLM_MTP_STAGE("end");
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -52344,9 +52436,11 @@ static bool glm_graph_mtp_step(
     if (!ok) {
         fprintf(stderr, "ds4: glm mtp step failed at stage '%s' (pos %u)\n",
                 mtp_stage, pos);
+        glm53_graph_mtp_note_write_failed(g, pos, false);
         return false;
     }
 #undef DS4_GLM_MTP_STAGE
+    glm53_graph_mtp_ledger_rows(g, pos, 1u, &next_token, pos);
     int best = 0;
     float best_v = g->mtp_logits_host[0];
     for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
@@ -52380,6 +52474,12 @@ static bool glm53_graph_mtp_rows(
     }
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (min_pos > pos || pos + n > cache_cap) return false;
+    if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_ROWS)) {
+        fprintf(stderr, "ds4: glm mtp rows failed at stage 'inject' (pos %u, rows %u)\n",
+                pos, n);
+        glm53_graph_mtp_note_write_failed(g, pos + n - 1u, false);
+        return false;
+    }
     if (!glm_graph_mtp_ensure(g) || !g->mtp_embed_rows || !g->mtp_hc_rows ||
         !g->mtp_chain_hidden) {
         return false;
@@ -52458,7 +52558,8 @@ static bool glm53_graph_mtp_rows(
         ds4_gpu_tensor *last = ds4_gpu_tensor_view(
                 g->mtp_hc_rows, (uint64_t)(n - 1u) * hc_row_bytes, hc_row_bytes);
         if (!glm53_graph_mtp_seam_store(g, model, weights, last,
-                                        pos + n - 1u, false)) {
+                                        pos + n - 1u,
+                                        (int32_t)next_tokens[n - 1u])) {
             fprintf(stderr, "ds4: glm mtp: seam save at pos %u failed\n",
                     pos + n - 1u);
         }
@@ -52471,8 +52572,10 @@ static bool glm53_graph_mtp_rows(
     if (!ok) {
         fprintf(stderr, "ds4: glm mtp rows failed at stage '%s' (pos %u, rows %u)\n",
                 mtp_stage, pos, n);
+        glm53_graph_mtp_note_write_failed(g, pos + n - 1u, false);
         return false;
     }
+    glm53_graph_mtp_ledger_rows(g, pos, n, next_tokens, pos);
     int best = 0;
     float best_v = g->mtp_logits_host[0];
     for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
@@ -52504,6 +52607,11 @@ static bool glm53_graph_mtp_chain(
     }
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (min_pos > pos || pos >= cache_cap) return false;
+    if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_CHAIN)) {
+        fprintf(stderr, "ds4: glm mtp chain failed at stage 'inject' (pos %u)\n", pos);
+        glm53_graph_mtp_note_write_failed(g, pos, true);
+        return false;
+    }
     if (!glm_graph_mtp_ensure(g) || !g->mtp_chain_hidden) {
         return false;
     }
@@ -52545,8 +52653,10 @@ static bool glm53_graph_mtp_chain(
     if (!ok) {
         fprintf(stderr, "ds4: glm mtp chain failed at stage '%s' (pos %u)\n",
                 mtp_stage, pos);
+        glm53_graph_mtp_note_write_failed(g, pos, true);
         return false;
     }
+    glm53_graph_mtp_ledger_chain(g, pos, next_token);
     int best = 0;
     float best_v = g->mtp_logits_host[0];
     for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
@@ -52587,26 +52697,33 @@ static void glm53_graph_mtp_clear_requests(ds4_glm_gpu_graph *g) {
     g->mtp_seam_save = false;
 }
 
+/* The fill writes the nextn KV slot always and the nextn indexer only when the
+ * session maintains it: the legacy cycle reads the KV without the indexer and
+ * must keep rewriting exactly what its decode rows write. */
 static bool glm53_graph_mtp_fill_supported(
         const ds4_glm_gpu_graph *g,
         const ds4_weights       *weights) {
     if (!g || !g->glm53 || !g->mtp_ready || !weights) return false;
-    if (!g->mtp_indexer_store || !g->mtp_kv_lora_cache || !g->mtp_k_rope_cache ||
-        !g->mtp_indexer_key_cache || !g->mtp_indexer_tail_k ||
-        !g->mtp_indexer_tail_gate || !g->hc_mean_weights ||
+    const bool indexer = g->mtp_indexer_store != 0;
+    if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->hc_mean_weights ||
         !g->mtp_fill_tokens || !g->mtp_fill_embed || !g->mtp_fill_hidden ||
         !g->mtp_fill_norm || !g->mtp_fill_concat || !g->mtp_fill_x ||
         !g->mtp_fill_attn_norm || !g->mtp_fill_kv_raw || !g->mtp_fill_kv_norm ||
-        !g->mtp_fill_indexer_k || !g->mtp_fill_indexer_gate) {
+        !g->mtp_fill_indexer_k || !g->mtp_fill_indexer_gate ||
+        (indexer && (!g->mtp_indexer_key_cache || !g->mtp_indexer_tail_k ||
+                     !g->mtp_indexer_tail_gate))) {
         return false;
     }
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const ds4_layer_weights *l = &weights->layer[il];
-    return l->nextn_enorm && l->nextn_hnorm && l->nextn_eh_proj &&
-           l->attn_norm && l->attn_kv_a_mqa && l->attn_kv_a_norm &&
-           l->indexer_attn_k && l->indexer_compressor_gate &&
-           l->indexer_k_norm && l->indexer_k_norm_b &&
-           l->indexer_compressor_ape && weights->output_norm;
+    if (!l->nextn_enorm || !l->nextn_hnorm || !l->nextn_eh_proj ||
+        !l->attn_norm || !l->attn_kv_a_mqa || !l->attn_kv_a_norm ||
+        !weights->output_norm) {
+        return false;
+    }
+    return !indexer || (l->indexer_attn_k && l->indexer_compressor_gate &&
+                        l->indexer_k_norm && l->indexer_k_norm_b &&
+                        l->indexer_compressor_ape);
 }
 
 /* Encode the attention-free prefix of n nextn rows at absolute positions
@@ -52617,7 +52734,8 @@ static bool glm53_graph_mtp_fill_supported(
  * nextn indexer key, gate and pooled entry.  token_scratch is device scratch
  * for the ids; it must not alias anything another row of the same batch reads
  * (host writes land immediately).  Nothing is read back and no command batch
- * is opened or closed here. */
+ * is opened or closed here.  The nextn indexer is written only when the
+ * session maintains it (glm53_graph_mtp_fill_supported()). */
 static bool glm53_graph_mtp_fill_rows(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52834,18 +52952,18 @@ static bool glm53_graph_mtp_fill_rows(
                                                      DS4_N_ROT,
                                                      glm_graph_compact_cache_is_f16()) != 0;
         }
-        if (ok) {
+        if (ok && g->mtp_indexer_store) {
             ok = glm53_graph_matmul_rows(idx_k, model, l->indexer_attn_k,
                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM,
                                          attn_norm, rows);
         }
-        if (ok) {
+        if (ok && g->mtp_indexer_store) {
             ok = glm53_graph_matmul_rows(idx_gate, model,
                                          l->indexer_compressor_gate,
                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM,
                                          attn_norm, rows);
         }
-        if (ok) {
+        if (ok && g->mtp_indexer_store) {
             ok = ds4_gpu_glm53_indexer_pool_update_tensor(
                     g->mtp_indexer_key_cache,
                     g->mtp_indexer_tail_k,
@@ -52877,12 +52995,13 @@ static bool glm53_graph_mtp_fill_rows(
         ds4_gpu_tensor_free(embed);
         ds4_gpu_tensor_free(ids);
     }
+    if (ok) glm53_graph_mtp_ledger_rows(g, pos0, n, next_tokens, pos0);
     return ok;
 }
 
 /* Park the post-norm trunk hidden (mHC mean through output_norm) of one row in
- * the seam slot.  slot_unwritten tells whether that row's nextn cache slot has
- * never been written: a prefill range leaves its last row as a hole, a decode
+ * the seam slot.  written_token tells what that row's nextn cache slot holds
+ * after this call: a prefill range leaves its last row unwritten (-1), a decode
  * row has already written it with the token the drafter predicted. */
 static bool glm53_graph_mtp_seam_store(
         ds4_glm_gpu_graph *g,
@@ -52890,9 +53009,10 @@ static bool glm53_graph_mtp_seam_store(
         const ds4_weights *weights,
         ds4_gpu_tensor    *hc_row,
         uint32_t           pos,
-        bool               slot_unwritten) {
+        int32_t            written_token) {
     if (!g || !g->glm53 || !model || !weights || !weights->output_norm ||
         !hc_row || !g->mtp_seam_hidden || !g->hc_output || !g->hc_mean_weights) {
+        glm53_graph_mtp_note_write_failed(g, pos, false);
         return false;
     }
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
@@ -52912,7 +53032,13 @@ static bool glm53_graph_mtp_seam_store(
     if (ok) {
         g->mtp_seam_pos = pos;
         g->mtp_seam_valid = true;
-        g->mtp_seam_unwritten = slot_unwritten;
+        g->mtp_seam_written = written_token;
+    } else {
+        /* Without a hidden this slot can never be rewritten, so a draft must
+         * not read it (ticket 005). */
+        g->mtp_seam_valid = false;
+        g->mtp_seam_written = -1;
+        glm53_graph_mtp_note_write_failed(g, pos, false);
     }
     return ok;
 }
@@ -52938,27 +53064,34 @@ static void glm53_graph_mtp_note_prefill(
     const bool flush_valid = g->mtp_seam_valid;
     glm53_graph_mtp_clear_requests(g);
     if (flush_token >= 0) {
-        if (!flush_valid) return;
-        if (glm53_graph_mtp_fill_rows(g, model, weights, &flush_token,
-                                      g->mtp_seam_token, NULL,
-                                      g->mtp_seam_hidden, flush_pos, 1u)) {
-            g->mtp_seam_unwritten = false;
-        } else {
+        if (!flush_valid) {
+            glm53_graph_mtp_note_write_failed(g, flush_pos, false);
+        } else if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_FLUSH) ||
+                   !glm53_graph_mtp_fill_rows(g, model, weights, &flush_token,
+                                              g->mtp_seam_token, NULL,
+                                              g->mtp_seam_hidden, flush_pos, 1u)) {
+            /* The slot keeps the token the drafter guessed, which the caller
+             * has just dropped: it must go unreadable rather than stay wrong. */
+            glm53_graph_mtp_note_write_failed(g, flush_pos, false);
             fprintf(stderr,
                     "ds4: glm mtp: seam flush at position %u failed\n",
                     flush_pos);
+        } else {
+            g->mtp_stat_rewrite++;
         }
         /* The seam is consumed.  A resumed request both flushes the previous
          * range and fills its own new rows, so the fill and the new seam
          * still run after the flush. */
         g->mtp_seam_pos = pos0 + n_rows;
         g->mtp_seam_valid = false;
-        g->mtp_seam_unwritten = false;
+        g->mtp_seam_written = -1;
     }
     if (fill != 0 && next) {
-        if (!glm53_graph_mtp_fill_rows(g, model, weights, next,
+        if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_FILL) ||
+            !glm53_graph_mtp_fill_rows(g, model, weights, next,
                                        g->mtp_fill_tokens, hc_rows, NULL,
                                        pos0, fill)) {
+            glm53_graph_mtp_note_write_failed(g, pos0 + fill - 1u, false);
             fprintf(stderr,
                     "ds4: glm mtp: prefill fill at position %u x%u failed\n",
                     pos0, fill);
@@ -52970,7 +53103,7 @@ static void glm53_graph_mtp_note_prefill(
                 hc_rows, n_rows - 1u,
                 DS4_N_HC * DS4_N_EMBD, DS4_N_HC * DS4_N_EMBD);
         if (!glm53_graph_mtp_seam_store(g, model, weights, last,
-                                        pos0 + n_rows - 1u, true)) {
+                                        pos0 + n_rows - 1u, -1)) {
             fprintf(stderr,
                     "ds4: glm mtp: seam save at position %u failed\n",
                     pos0 + n_rows - 1u);
@@ -61708,6 +61841,12 @@ struct ds4_session {
      * start, so validity is tracked separately from the value. */
     uint32_t glm_mtp_min_pos;
     bool glm_mtp_min_pos_valid;
+    /* Ticket 005 read floor: the first nextn cache slot a draft may read.  A
+     * slot whose write failed, or whose content no session can name, is worse
+     * than a hole, so a failed or unrewritable slot raises this past it and it
+     * only rises again until a cold prefill rewrites every slot.  The draft
+     * window starts at max(glm_mtp_min_pos, this). */
+    uint32_t glm_mtp_read_floor;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     float *glm53_verify_hc;          /* fast GLM-5.3 cycle: [3][hc][embd] verify rows */
@@ -62760,9 +62899,203 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
 static void ds4_session_glm_mtp_seam_invalidate(ds4_session *s) {
     if (!s) return;
     s->glm_graph.mtp_seam_valid = false;
-    s->glm_graph.mtp_seam_unwritten = false;
+    s->glm_graph.mtp_seam_written = -1;
     s->glm_graph.mtp_seam_pos = 0;
     glm53_graph_mtp_clear_requests(&s->glm_graph);
+}
+
+static bool ds4_engine_glm_mtp_spec_enabled(const ds4_engine *e);
+static bool ds4_session_glm_mtp_cache_enabled(const ds4_session *s);
+
+/* Sessions whose drafts read the nextn caches at all: the fast cycle and the
+ * legacy cycle.  Everything else (MTP off, GLM 5.2, TP, layer slices, ssd
+ * streaming) never reads a slot, so its read floor stays untouched. */
+static bool ds4_session_glm_mtp_tracked(const ds4_session *s) {
+    return s && s->glm_graph.glm53 && ds4_engine_glm_mtp_spec_enabled(s->engine);
+}
+
+/* The first nextn cache slot a draft may read: the request's window start, kept
+ * above the ticket-005 floor of slots that are stale, unknown or failed.
+ * ds4_session_glm_mtp_window_start() reports this same value. */
+static uint32_t ds4_session_glm_mtp_draft_min_pos(const ds4_session *s) {
+    if (!s) return 0u;
+    return s->glm_mtp_min_pos > s->glm_mtp_read_floor ?
+           s->glm_mtp_min_pos : s->glm_mtp_read_floor;
+}
+
+/* Take the slot-write failures the graph recorded since the last call: every
+ * slot up to and including the failed one goes unreadable, and the seam stops
+ * describing a slot whose write failed.  Returns that slot, or
+ * DS4_GLM_MTP_NO_SLOT when nothing failed. */
+static uint32_t ds4_session_glm_mtp_absorb_writes(ds4_session *s) {
+    if (!s) return DS4_GLM_MTP_NO_SLOT;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint32_t failed = g->mtp_write_failed;
+    if (failed == DS4_GLM_MTP_NO_SLOT) return DS4_GLM_MTP_NO_SLOT;
+    g->mtp_write_failed = DS4_GLM_MTP_NO_SLOT;
+    if (failed + 1u > s->glm_mtp_read_floor) s->glm_mtp_read_floor = failed + 1u;
+    if (g->mtp_seam_pos == failed) {
+        g->mtp_seam_valid = false;
+        g->mtp_seam_written = -1;
+    }
+    return failed;
+}
+
+/* The token at the checkpoint's running position has just become known: the
+ * checkpoint's last nextn slot must hold (token, hidden[len-1]), and when it
+ * cannot, a draft must not read it.  Returns the token to hand to the graph's
+ * seam rewrite, or -1 when nothing has to be rewritten (the slot already holds
+ * this token, or is already given up on). */
+static int ds4_session_glm_mtp_note_token(ds4_session *s, int token) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    if (g->mtp_seam_pos + 1u == pos && g->mtp_seam_written == (int32_t)token) {
+        return -1;   /* greedy: the drafter guessed right, nothing to rewrite */
+    }
+    if (g->mtp_seam_pos + 1u == pos && g->mtp_seam_valid) return token;
+    /* Nothing describes this position, or its hidden is gone: the slot may
+     * still hold a token the checkpoint dropped, so it goes unreadable.  A
+     * session that never fills the caches densely (the legacy cycle) has holes
+     * before its window start by design and is covered by that start. */
+    if (ds4_session_glm_mtp_tracked(s) && pos > s->glm_mtp_read_floor) {
+        s->glm_mtp_read_floor = pos;
+    }
+    return -1;
+}
+
+/* The seam is gone for good: whatever the last slot holds is no longer known,
+ * so a draft must not read it. */
+static void ds4_session_glm_mtp_seam_drop(ds4_session *s) {
+    if (!s) return;
+    ds4_session_glm_mtp_seam_invalidate(s);
+    const uint32_t len = s->checkpoint.len > 0 ? (uint32_t)s->checkpoint.len : 0u;
+    if (ds4_session_glm_mtp_tracked(s) && len > s->glm_mtp_read_floor) {
+        s->glm_mtp_read_floor = len;
+    }
+}
+
+/* Drop left-over nextn cache requests after a forward call.  A seam rewrite no
+ * forward consumed never happened, so its slot keeps the token the caller has
+ * just dropped and goes unreadable. */
+static void ds4_session_glm_mtp_end_requests(ds4_session *s) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (g->mtp_seam_flush >= 0) {
+        glm53_graph_mtp_note_write_failed(g, g->mtp_seam_pos, false);
+    }
+    glm53_graph_mtp_clear_requests(g);
+    (void)ds4_session_glm_mtp_absorb_writes(s);
+}
+
+/* Run the queued seam rewrite in a command batch of its own.  The fast cycle
+ * folds it into the batch its eval or verify pass opens instead (004); the
+ * legacy cycle verifies through the dense batch and the decode-style row batch,
+ * neither of which has a nextn hook, so its rewrite goes here.  It still runs
+ * before anything drafts from the slot. */
+static bool ds4_session_glm_mtp_flush_now(ds4_session *s) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const int32_t token = g->mtp_seam_flush;
+    if (token < 0) return true;
+    g->mtp_seam_flush = -1;
+    const uint32_t pos = g->mtp_seam_pos;
+    if (!g->mtp_seam_valid) {
+        glm53_graph_mtp_note_write_failed(g, pos, false);
+        return false;
+    }
+    const int next = (int)token;
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok) {
+        ok = glm53_graph_mtp_fill_rows(g, &s->engine->model, &s->engine->weights,
+                                       &next, g->mtp_seam_token, NULL,
+                                       g->mtp_seam_hidden, pos, 1u);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) {
+        g->mtp_stat_rewrite++;
+        g->mtp_seam_written = token;
+    } else {
+        glm53_graph_mtp_note_write_failed(g, pos, false);
+        fprintf(stderr, "ds4: glm mtp: seam rewrite at position %u failed\n", pos);
+    }
+    return ok;
+}
+
+/* Park the trunk hidden of the row the graph just decoded (g->hc_cur) in the
+ * seam, opening a command batch of its own. */
+static bool ds4_session_glm_mtp_seam_save_cur(ds4_session *s, uint32_t pos,
+                                              int32_t written_token) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    if (!g->glm53) return false;
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok) {
+        ok = glm53_graph_mtp_seam_store(g, m, w, g->hc_cur, pos, written_token);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
+/* Park the post-norm hidden of an mHC row held on the host in the seam: the
+ * rows a verify pass saved, which the next cycle has not overwritten yet. */
+static bool ds4_session_glm_mtp_seam_save_host(ds4_session *s,
+                                               const float *hc_row,
+                                               uint32_t pos,
+                                               int32_t written_token) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (!g->glm53 || !hc_row || !g->mtp_hc_rows ||
+        ds4_gpu_tensor_bytes(g->mtp_hc_rows) < row_bytes) {
+        return false;
+    }
+    /* Host writes land immediately, so the upload goes up before the batch. */
+    if (ds4_gpu_tensor_write(g->mtp_hc_rows, 0, hc_row, row_bytes) == 0) {
+        return false;
+    }
+    ds4_gpu_tensor *row = ds4_gpu_tensor_view(g->mtp_hc_rows, 0, row_bytes);
+    if (!row) return false;
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok) ok = glm53_graph_mtp_seam_store(g, m, w, row, pos, written_token);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    ds4_gpu_tensor_free(row);
+    return ok;
+}
+
+/* Write one nextn slot from an mHC row held on the host, through the batched
+ * fill path 004 introduced for prefill: slot pos gets (token, hc_row).  The
+ * nextn indexer follows the session's configuration, exactly like the decode
+ * rows this slot has to match. */
+static bool ds4_session_glm_mtp_write_slot_host(ds4_session *s,
+                                                const float *hc_row,
+                                                uint32_t pos,
+                                                int token) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    const uint64_t row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (!g->glm53 || !hc_row || !g->mtp_hc_rows ||
+        ds4_gpu_tensor_bytes(g->mtp_hc_rows) < row_bytes ||
+        pos >= glm_graph_mtp_cache_cap(g)) {
+        return false;
+    }
+    if (ds4_gpu_tensor_write(g->mtp_hc_rows, 0, hc_row, row_bytes) == 0) {
+        return false;
+    }
+    const int tok = token;
+    bool ok = glm_graph_begin_commands_if_needed();
+    if (ok) {
+        ok = glm53_graph_mtp_fill_rows(g, m, w, &tok, g->mtp_fill_tokens,
+                                       g->mtp_hc_rows, NULL, pos, 1u);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (ok) s->glm_graph.mtp_stat_replacement++;
+    else glm53_graph_mtp_note_write_failed(g, pos, false);
+    return ok;
 }
 
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
@@ -63436,8 +63769,9 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
             s->mtp_draft_valid = false;
             s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
             /* The shard carries no nextn caches and no seam hidden, so the
-             * restored checkpoint starts with no seam (ticket 004). */
-            ds4_session_glm_mtp_seam_invalidate(s);
+             * restored checkpoint starts with no seam and with nothing it may
+             * draft from (tickets 004 and 005). */
+            ds4_session_glm_mtp_seam_drop(s);
         }
         free(n_comp);
         free(n_index_comp);
@@ -64975,8 +65309,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
         /* The .kv payload has no seam hidden field yet, so a restored session
          * has no seam: the one position that waited for its next token stays
-         * unwritten until the payload grows that field. */
-        ds4_session_glm_mtp_seam_invalidate(s);
+         * unwritten until the payload grows that field, and nothing above it
+         * is readable for a draft either (ticket 005). */
+        ds4_session_glm_mtp_seam_drop(s);
         return 0;
 #endif
     }
@@ -75183,15 +75518,13 @@ static int ds4_session_glm53_fast_spec_cycle(
         return -1;
     }
     g->mtp_indexer_store = 1;
-    /* The prompt's last row has no nextn cache entry yet: vLLM feeds the
-     * drafter (token[p+1], hidden[p]) and first_token is the token at position
-     * pos, so the seam slot pos-1 can be filled now.  Queue it before the
-     * plain eval or the verify pass, both of which overwrite g->hc_cur; the
-     * first forward call encodes it into a command batch that is open anyway. */
-    if (g->mtp_seam_valid && g->mtp_seam_unwritten &&
-        g->mtp_seam_pos + 1u == pos) {
-        g->mtp_seam_flush = first_token;
-    }
+    /* Rule 1 (ticket 005): first_token is the token at position pos, so the
+     * checkpoint's last nextn slot must hold it.  It already does when the
+     * drafter guessed right (greedy always does, so this costs no extra write);
+     * otherwise the seam rewrite goes into the first command batch this cycle
+     * opens anyway, before any draft reads the slot.  When neither the slot's
+     * token nor its hidden can be trusted, the slot goes unreadable. */
+    g->mtp_seam_flush = ds4_session_glm_mtp_note_token(s, first_token);
     int depth = exact_sampling ? 2 : glm53_spec_depth(s);
     if (depth == 3 && !glm53_graph_mtp_ensure_row1(g)) depth = 2;
     s->glm_mtp_rollback_valid = false;
@@ -75210,25 +75543,27 @@ static int ds4_session_glm53_fast_spec_cycle(
         g->mtp_seam_save = true;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
-        glm53_graph_mtp_clear_requests(g);
+        ds4_session_glm_mtp_end_requests(s);
         if (rc != 0) return -1;
         const int n1 = glm_session_logits_argmax(s->logits);
         ds4_session_glm_note_mtp_window_start(s, pos);
         int d = -1;
+        const uint32_t min_pos = ds4_session_glm_mtp_draft_min_pos(s);
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
-        if (glm_graph_mtp_step(g, m, w, n1, pos, s->glm_mtp_min_pos, &d)) {
+        if (glm_graph_mtp_step(g, m, w, n1, pos, min_pos, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
             int d2 = -1;
             if (depth == 3 && pos + 2u <= mtp_cap &&
-                glm53_graph_mtp_chain(g, m, w, d, pos + 1u, s->glm_mtp_min_pos, &d2)) {
+                glm53_graph_mtp_chain(g, m, w, d, pos + 1u, min_pos, &d2)) {
                 s->glm_mtp_draft2 = d2;
                 s->glm_mtp_have2 = true;
             }
         }
         accepted[0] = first_token;
+        (void)ds4_session_glm_mtp_absorb_writes(s);
         return 1;
     }
 
@@ -75264,10 +75599,12 @@ static int ds4_session_glm53_fast_spec_cycle(
                     captured, want);
         }
         if (saved) (void)glm53_graph_copy_spec_state(g, false);
+        glm53_graph_mtp_clear_requests(g);
         if (errlen) snprintf(err, errlen, "glm mtp: GLM 5.3 verify failed");
         s->checkpoint_valid = false;
         return -1;
     }
+    ds4_session_glm_mtp_end_requests(s);
     const double t1 = timing ? now_sec() : 0.0;
     const float *rows = s->glm53_verify_logits;
     const uint32_t trunk_last = glm53_graph_trunk_last_layer(g);
@@ -75352,16 +75689,39 @@ static int ds4_session_glm53_fast_spec_cycle(
                 n_committed = 2;
                 ds4_session_glm_note_dense_cache(s, pos, 2);
                 accepted[1] = replacement;
+                /* Rule 2.3: replacement is a committed token, so the slot this
+                 * verify pass left at pos has to hold it.  Its hidden is the
+                 * verify pass's own row 0, which the next cycle has not
+                 * overwritten yet.  A failure only costs the slot: the
+                 * committed tokens stand, like every other failed write. */
+                if (!ds4_session_glm_mtp_write_slot_host(s, s->glm53_verify_hc,
+                                                         pos, replacement)) {
+                    fprintf(stderr,
+                            "ds4: glm mtp: replacement write at pos %u failed\n",
+                            pos);
+                }
+                /* The replayed replacement row is the request's last position
+                 * from here on.  Park its hidden as the seam before drafting:
+                 * even when no draft runs (an EOS replacement) the next request
+                 * has to be able to fill this slot. */
+                if (!ds4_session_glm_mtp_seam_save_cur(s, pos + 1u, -1)) {
+                    fprintf(stderr,
+                            "ds4: glm mtp: seam save at pos %u failed\n",
+                            pos + 1u);
+                }
                 const int next = glm_session_logits_argmax(s->logits);
                 int nd = -1;
-                /* The replayed replacement row is the request's last
-                 * position; glm_graph_mtp_step() keeps its seam. */
-                g->mtp_seam_save = true;
-                if (replacement != eos_token &&
-                    glm_graph_mtp_step(g, m, w, next, pos + 1u, s->glm_mtp_min_pos, &nd)) {
-                    s->glm_mtp_draft = nd;
-                    s->glm_mtp_parent = next;
-                    s->glm_mtp_have = 1;
+                if (replacement != eos_token) {
+                    /* glm_graph_mtp_step() writes this slot and re-parks the
+                     * seam with the token it used. */
+                    g->mtp_seam_save = true;
+                    if (glm_graph_mtp_step(g, m, w, next, pos + 1u,
+                                           ds4_session_glm_mtp_draft_min_pos(s),
+                                           &nd)) {
+                        s->glm_mtp_draft = nd;
+                        s->glm_mtp_parent = next;
+                        s->glm_mtp_have = 1;
+                    }
                 }
             }
         } else if (ok) {
@@ -75382,21 +75742,24 @@ static int ds4_session_glm53_fast_spec_cycle(
          * post-norm hidden as the seam; glm53_graph_mtp_rows() stores it. */
         g->mtp_seam_save = true;
         if (glm53_graph_mtp_rows(g, m, w, mtp_tokens, s->glm53_verify_hc, mtp_n,
-                                 pos, s->glm_mtp_min_pos, &nd)) {
+                                 pos, ds4_session_glm_mtp_draft_min_pos(s), &nd)) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
             int nd2 = -1;
             if (depth == 3 && pos + mtp_n + 1u <= mtp_cap &&
                 glm53_graph_mtp_chain(g, m, w, nd, pos + mtp_n,
-                                      s->glm_mtp_min_pos, &nd2)) {
+                                      ds4_session_glm_mtp_draft_min_pos(s),
+                                      &nd2)) {
                 s->glm_mtp_draft2 = nd2;
                 s->glm_mtp_have2 = true;
             }
         }
     }
-    /* Drop a seam request the catch-up did not reach. */
-    glm53_graph_mtp_clear_requests(g);
+    /* Drop a seam request the catch-up did not reach and take the write
+     * failures this cycle caused: a failed slot goes unreadable rather than
+     * staying wrong, and the committed tokens still stand. */
+    ds4_session_glm_mtp_end_requests(s);
     if (timing) {
         const double t2 = now_sec();
         char *dt = ds4_token_text(e, d, NULL);
@@ -75473,25 +75836,38 @@ static int ds4_session_glm_spec_cycle_impl(
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) {
         s->glm_mtp_have = 0;
     }
+    /* Rule 1 (ticket 005), same as the fast cycle: first_token is the token at
+     * position pos.  The legacy cycle reads the nextn KV without the indexer,
+     * so its seam rewrite fills the KV alone, and it runs here rather than in
+     * the verify batch: the dense batch this cycle may use has no nextn hook. */
+    if (g->glm53) {
+        g->mtp_seam_flush = ds4_session_glm_mtp_note_token(s, first_token);
+        ds4_session_glm_mtp_flush_now(s);
+    }
     if (!s->glm_mtp_have || accepted_cap < 2 ||
         pos + 2 > g->ctx_size ||
         (g->compact_cache_cap != 0 && pos + 1 >= g->compact_cache_cap)) {
         /* Plain step, then seed the first draft from g->cur. */
+        if (g->glm53) g->mtp_seam_save = true;
         s->glm_spec_inside = 1;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
+        if (g->glm53) ds4_session_glm_mtp_end_requests(s);
         if (rc != 0) return -1;
         const int n1 = glm_session_logits_argmax(s->logits);
         ds4_session_glm_note_mtp_window_start(s, pos);
         int d = -1;
+        const uint32_t min_pos = g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s) :
+                                           s->glm_mtp_min_pos;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &d)) {
+                               min_pos, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
         }
         accepted[0] = first_token;
+        if (g->glm53) (void)ds4_session_glm_mtp_absorb_writes(s);
         return 1;
     }
 
@@ -75655,17 +76031,24 @@ static int ds4_session_glm_spec_cycle_impl(
         const int n2 = glm_session_logits_argmax(s->logits);
         int dummy = -1, nd = -1;
         ds4_gpu_tensor *target_hidden = g->glm53 ? g->hc_cur : g->cur;
-        const bool cu =
+        const uint32_t min_pos = g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s) :
+                                           s->glm_mtp_min_pos;
+        bool cu =
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
-            ds4_gpu_tensor_write(target_hidden,
-                                 0,
-                                 s->glm_mtp_hc + hc_row_values,
-                                 hc_row_bytes) != 0 &&
-            glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
-                               s->glm_mtp_min_pos, &nd);
+                               min_pos, &dummy);
+        /* The second catch-up row is the request's last position: keep its
+         * post-norm hidden as the seam, holding the token this row guessed. */
+        if (cu && g->glm53) g->mtp_seam_save = true;
+        if (cu) {
+            cu = ds4_gpu_tensor_write(target_hidden,
+                                      0,
+                                      s->glm_mtp_hc + hc_row_values,
+                                      hc_row_bytes) != 0 &&
+                 glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
+                                    min_pos, &nd);
+        }
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n2;
@@ -75715,16 +76098,36 @@ static int ds4_session_glm_spec_cycle_impl(
             accepted[0] = first_token;
             accepted[1] = replacement;
 
+            /* Rule 2.3: the verify pass left slot pos without the committed
+             * replacement; its hidden is the verify pass's row 0.  The
+             * replacement's own row then becomes the last position, and its
+             * seam survives even when the replacement is the EOS token and no
+             * draft runs. */
+            if (g->glm53) {
+                if (!ds4_session_glm_mtp_write_slot_host(s, s->glm_mtp_hc, pos,
+                                                         replacement)) {
+                    fprintf(stderr,
+                            "ds4: glm mtp: replacement write at pos %u failed\n",
+                            pos);
+                }
+                if (!ds4_session_glm_mtp_seam_save_cur(s, pos + 1u, -1)) {
+                    fprintf(stderr,
+                            "ds4: glm mtp: seam save at pos %u failed\n",
+                            pos + 1u);
+                }
+            }
             const int next = glm_session_logits_argmax(s->logits);
             int nd = -1;
             s->glm_mtp_have = 0;
+            if (g->glm53) g->mtp_seam_save = true;
             if (replacement != eos_token &&
                 glm_graph_mtp_step(g,
                                    &e->model,
                                    &e->weights,
                                    next,
                                    pos + 1u,
-                                   s->glm_mtp_min_pos,
+                                   g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s)
+                                            : s->glm_mtp_min_pos,
                                    &nd)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
@@ -75740,9 +76143,12 @@ static int ds4_session_glm_spec_cycle_impl(
                                  0,
                                  s->glm_mtp_hc,
                                  hc_row_bytes) != 0;
+        if (!exact_sampling && g->glm53) g->mtp_seam_save = true;
         const bool cu = !exact_sampling && hidden_ready &&
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               s->glm_mtp_min_pos, &nd);
+                               g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s)
+                                        : s->glm_mtp_min_pos,
+                               &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = n1;
@@ -75773,7 +76179,62 @@ static int ds4_session_glm_spec_cycle_impl(
         s->glm_mtp_rollback_fast = false;
         s->glm_mtp_rollback_saved = true;
     }
+    if (g->glm53) {
+        /* Take the write failures this cycle caused: a failed slot goes
+         * unreadable rather than staying wrong, and the committed tokens
+         * still stand.  The queued seam rewrite was spent at the cycle entry. */
+        ds4_session_glm_mtp_end_requests(s);
+    }
     return n_committed;
+}
+
+/* Rule 2.6 (ticket 005): after a rewind that keeps the first `keep` tokens of
+ * the rolled-back block, the checkpoint's last nextn slot is
+ * rollback_pos + keep - 1.  It holds the token the rewind drops -- the cycle
+ * wrote it while it still believed in it -- and its hidden is that verify pass's
+ * row keep-1: the fast cycle saved every verify row on the host and the next
+ * cycle has not overwritten them yet, the legacy cycle replays the kept row.
+ * With keep == 0 the last slot is the one before the block, which the cycle
+ * already rewrote with first_token on its way in; its hidden is gone, so a
+ * differing next token retires that slot instead of rewriting it. */
+static void ds4_session_glm_mtp_rewind_seam(ds4_session *s, uint32_t start,
+                                            uint32_t keep, bool fast) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    glm53_graph_mtp_clear_requests(g);
+    if (keep == 0u) {
+        if (start == 0u) {
+            ds4_session_glm_mtp_seam_invalidate(s);
+            return;
+        }
+        g->mtp_seam_pos = start - 1u;
+        g->mtp_seam_written = s->glm_mtp_rollback_first_token;
+        g->mtp_seam_valid = false;
+        return;
+    }
+    const uint32_t slot = start + keep - 1u;
+    const int dropped = (uint32_t)s->checkpoint.len > start + keep ?
+                        s->checkpoint.v[start + keep] : -1;
+    bool stored = false;
+    if (dropped >= 0) {
+        if (fast) {
+            const uint64_t row_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+            stored = s->glm53_verify_hc && keep <= 3u &&
+                     ds4_session_glm_mtp_seam_save_host(
+                         s, s->glm53_verify_hc +
+                            (size_t)(keep - 1u) * row_values,
+                         slot, (int32_t)dropped);
+        } else {
+            stored = ds4_session_glm_mtp_seam_save_cur(s, slot,
+                                                       (int32_t)dropped);
+        }
+    }
+    if (!stored) {
+        /* No hidden to rewrite with: the next token retires this slot through
+         * rule 1 instead of leaving the dropped token in it. */
+        g->mtp_seam_pos = slot;
+        g->mtp_seam_written = -1;
+        g->mtp_seam_valid = false;
+    }
 }
 
 /* Restore the state immediately before the last two-token GLM-5.3 MTP cycle,
@@ -75788,6 +76249,8 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     }
     const uint32_t start = s->glm_mtp_rollback_pos;
     ds4_glm_gpu_graph *g = &s->glm_graph;
+    /* A rewind is not a place to spend a queued nextn write on. */
+    glm53_graph_mtp_clear_requests(g);
     if (s->glm_mtp_rollback_fast) {
         /* Row snapshots hold the state after row 0 / row 1 of the verify. */
         const uint32_t keep = (uint32_t)pos - start;
@@ -75805,6 +76268,7 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
         }
         s->glm_dense_cache_len = s->glm_mtp_rollback_dense_len;
         if (ok && keep != 0u) ds4_session_glm_note_dense_cache(s, start, keep);
+        if (ok) ds4_session_glm_mtp_rewind_seam(s, start, keep, true);
         s->glm_mtp_rollback_valid = false;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
@@ -75823,6 +76287,10 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
                                      s->logits,
                                      false);
         if (ok) ds4_session_glm_note_dense_cache(s, start, 1);
+    }
+    if (ok) {
+        ds4_session_glm_mtp_rewind_seam(s, start,
+                                        (uint32_t)pos - start, false);
     }
     s->glm_mtp_rollback_valid = false;
     s->glm_mtp_have = 0;
@@ -77390,6 +77858,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
             s->mtp_draft_valid = false;
             ds4_session_glm_reset_dense_cache(s);
+            /* A cold prefill writes every nextn slot from scratch, so nothing
+             * is blocked any more (ticket 005). */
+            s->glm_mtp_read_floor = 0;
+            s->glm_graph.mtp_write_failed = DS4_GLM_MTP_NO_SLOT;
             if (!ds4_session_glm_reset_kda_state(s)) {
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
@@ -77412,26 +77884,28 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     /* The previous request's last position gets its real next
                      * token here: the first new prompt token.  That slot may
                      * already hold the token the drafter predicted while
-                     * decoding; it is rewritten with the actual token. */
+                     * decoding; it is rewritten with the actual token, skipped
+                     * when the guess already was it, and given up on when
+                     * neither the token nor the hidden can be trusted. */
                     if (resumed_checkpoint && prompt->len == start) {
                         /* Nothing to append: the checkpoint keeps its length
                          * and its last position, so the seam still describes
                          * it and survives untouched. */
-                    } else if (resumed_checkpoint && prompt->len > start &&
-                               mg->mtp_seam_valid &&
-                               mg->mtp_seam_pos + 1u == (uint32_t)start) {
-                        mg->mtp_seam_flush = prompt->v[start];
+                    } else if (resumed_checkpoint) {
+                        mg->mtp_seam_flush =
+                            ds4_session_glm_mtp_note_token(s, prompt->v[start]);
                     } else {
                         ds4_session_glm_mtp_seam_invalidate(s);
                     }
                 } else {
                     fprintf(stderr, "ds4: glm mtp: prefill fill disabled\n");
-                    ds4_session_glm_mtp_seam_invalidate(s);
+                    ds4_session_glm_mtp_seam_drop(s);
                 }
             } else {
                 /* MTP off, an unsupported configuration, or image embeddings:
-                 * this sync writes no nextn cache, so the seam is dead. */
-                ds4_session_glm_mtp_seam_invalidate(s);
+                 * this sync writes no nextn cache, so the seam is dead and the
+                 * last slot is not something a draft may read. */
+                ds4_session_glm_mtp_seam_drop(s);
                 mg->mtp_indexer_store = 0;
             }
         }
@@ -77452,7 +77926,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     snprintf(err, errlen, "interrupted");
                     s->checkpoint_valid = s->checkpoint.len > 0;
                     s->mtp_draft_valid = false;
-                    ds4_session_glm_mtp_seam_invalidate(s);
+                    ds4_session_glm_mtp_seam_drop(s);
                     ds4_session_glm_cap_dense_cache(s);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
@@ -77559,15 +78033,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                              backend_name, i);
                     s->checkpoint_valid = false;
                     s->mtp_draft_valid = false;
-                    ds4_session_glm_mtp_seam_invalidate(s);
+                    ds4_session_glm_mtp_seam_drop(s);
                     ds4_session_glm_cap_dense_cache(s);
                     return 1;
                 }
                 if (glm53_mtp_fill) {
                     /* The forward call consumed the requests if it got that
                      * far; drop whatever is left so it cannot land on a later
-                     * call. */
-                    glm53_graph_mtp_clear_requests(&s->glm_graph);
+                     * call, and take the write failures of this chunk. */
+                    ds4_session_glm_mtp_end_requests(s);
                 }
                 for (uint32_t j = 0; j < chunk; j++) {
                     token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
@@ -79284,6 +79758,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
 #endif
     if (ds4_session_is_glm(s)) {
+        bool seam_requests = false;
         if (!s->glm_graph_ready) {
             if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
                                  ds4_backend_name(e->backend));
@@ -79297,10 +79772,24 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!s->glm_spec_inside) {
             s->glm_mtp_rollback_valid = false;
             s->glm_mtp_have = 0;
-            /* Plain decode appends a token without writing any nextn cache
-             * slot, so the seam's position is no longer the checkpoint's last
-             * position: drop it (ticket 004). */
-            ds4_session_glm_mtp_seam_invalidate(s);
+            /* Rule 2.5 (ticket 005): a plain eval is a continuation of one
+             * token.  It is the token the checkpoint's last nextn slot has
+             * been waiting for, and the row it decodes becomes the new last
+             * position with no token yet, so the seam both fills and re-parks
+             * inside this row's command batch.  Sessions that do not maintain
+             * the nextn caches densely (the legacy cycle, MTP off) keep the
+             * old behaviour: no work, no allocation. */
+            if (ds4_session_glm_mtp_cache_enabled(s)) {
+                s->glm_graph.mtp_seam_flush =
+                    ds4_session_glm_mtp_note_token(s, token);
+                s->glm_graph.mtp_seam_save = true;
+                seam_requests = true;
+            } else {
+                /* Plain decode appends a token without writing any nextn cache
+                 * slot, so the seam's position is no longer the checkpoint's
+                 * last position (ticket 004). */
+                ds4_session_glm_mtp_seam_invalidate(s);
+            }
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
         const bool updates_dense =
@@ -79315,6 +79804,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      s->logits,
                                      false))
         {
+            if (seam_requests) glm53_graph_mtp_clear_requests(&s->glm_graph);
             if (errlen) snprintf(err, errlen, "%s GLM decode failed",
                                  ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
@@ -79322,6 +79812,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds4_session_glm_cap_dense_cache(s);
             return 1;
         }
+        if (seam_requests) ds4_session_glm_mtp_end_requests(s);
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -87164,9 +87655,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
-    /* The checkpoint got shorter without a nextn write for the dropped rows,
-     * so the seam no longer describes the last position. */
-    ds4_session_glm_mtp_seam_invalidate(s);
+    /* A GLM-5.3 rewind whose state came back keeps its seam: the rollback
+     * restored the last slot of the kept prefix with the token it holds and
+     * the hidden a rewrite needs.  Every other rewind leaves the last slot
+     * describing dropped history, so it goes unreadable (ticket 005). */
+    if (!state_ok) ds4_session_glm_mtp_seam_drop(s);
+    (void)ds4_session_glm_mtp_absorb_writes(s);
     if (s->glm_mtp_min_pos_valid && (uint32_t)pos < s->glm_mtp_min_pos) {
         /* Nothing left of the draft window: re-decide it at the next plain
          * step instead of leaving min_pos above the running position. */
@@ -87187,7 +87681,9 @@ bool ds4_session_checkpoint_valid(const ds4_session *s) {
 bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out) {
 #ifndef DS4_NO_GPU
     if (!s || !s->glm_mtp_min_pos_valid || !start_out) return false;
-    *start_out = s->glm_mtp_min_pos;
+    /* What the draft actually reads: the request's window start, never below
+     * the ticket-005 floor of slots that went unreadable. */
+    *start_out = ds4_session_glm_mtp_draft_min_pos(s);
     return true;
 #else
     (void)s;
@@ -87366,6 +87862,92 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
     }
     return 1;
 }
+
+/* Ticket 005 test hooks: the per-slot write ledger, the read floor, one-shot
+ * write-failure injection and the counters.  All of them are off by default;
+ * only the ledger allocates, and only when a test asks for it. */
+void ds4_test_glm_mtp_ledger(ds4_session *s, int enable) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return;
+    if (!enable) {
+        free(g->mtp_ledger_token);
+        free(g->mtp_ledger_hidden);
+        g->mtp_ledger_token = NULL;
+        g->mtp_ledger_hidden = NULL;
+        g->mtp_ledger_cap = 0;
+        return;
+    }
+    const uint32_t cap = glm_graph_mtp_cache_cap(g);
+    if (g->mtp_ledger_token && g->mtp_ledger_cap == cap) {
+        memset(g->mtp_ledger_token, 0xFF, (size_t)cap * sizeof(uint32_t));
+        memset(g->mtp_ledger_hidden, 0xFF, (size_t)cap * sizeof(uint32_t));
+        return;
+    }
+    free(g->mtp_ledger_token);
+    free(g->mtp_ledger_hidden);
+    g->mtp_ledger_token = calloc(cap, sizeof(uint32_t));
+    g->mtp_ledger_hidden = calloc(cap, sizeof(uint32_t));
+    g->mtp_ledger_cap = g->mtp_ledger_token && g->mtp_ledger_hidden ? cap : 0;
+    if (!g->mtp_ledger_token || !g->mtp_ledger_hidden) {
+        free(g->mtp_ledger_token);
+        free(g->mtp_ledger_hidden);
+        g->mtp_ledger_token = NULL;
+        g->mtp_ledger_hidden = NULL;
+        fprintf(stderr, "ds4-test: glm mtp ledger allocation failed\n");
+        return;
+    }
+    /* 0xFF is DS4_GLM_MTP_LEDGER_NONE for the token and the hidden both. */
+    memset(g->mtp_ledger_token, 0xFF, (size_t)cap * sizeof(uint32_t));
+    memset(g->mtp_ledger_hidden, 0xFF, (size_t)cap * sizeof(uint32_t));
+}
+
+int ds4_test_glm_mtp_ledger_slot(ds4_session *s, uint32_t pos,
+                                 uint32_t *token, uint32_t *hidden_pos) {
+    const ds4_glm_gpu_graph *g = s ? &s->glm_graph : NULL;
+    if (!g || !g->mtp_ledger_token || pos >= g->mtp_ledger_cap) return -1;
+    if (g->mtp_ledger_hidden[pos] == DS4_GLM_MTP_LEDGER_NONE) return 0;
+    if (token) *token = g->mtp_ledger_token[pos];
+    if (hidden_pos) *hidden_pos = g->mtp_ledger_hidden[pos];
+    return 1;
+}
+
+uint32_t ds4_test_glm_mtp_read_floor(ds4_session *s) {
+    return s ? s->glm_mtp_read_floor : 0u;
+}
+
+int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
+                                int *hidden_kept) {
+    const ds4_glm_gpu_graph *g = s ? &s->glm_graph : NULL;
+    if (!g || !g->glm53) return 0;
+    if (pos) *pos = g->mtp_seam_pos;
+    if (written) *written = g->mtp_seam_written;
+    if (hidden_kept) *hidden_kept = g->mtp_seam_valid ? 1 : 0;
+    return 1;
+}
+
+int ds4_test_glm_mtp_dense(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_glm_mtp_cache_enabled(s) ? 1 : 0;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+void ds4_test_glm_mtp_fail_next(ds4_session *s, int kind) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return;
+    g->mtp_fail_kind = kind;
+}
+
+void ds4_test_glm_mtp_stats(ds4_session *s, uint32_t *rewrites,
+                            uint32_t *replacements, uint32_t *failures) {
+    const ds4_glm_gpu_graph *g = s ? &s->glm_graph : NULL;
+    if (!g) return;
+    if (rewrites) *rewrites = g->mtp_stat_rewrite;
+    if (replacements) *replacements = g->mtp_stat_replacement;
+    if (failures) *failures = g->mtp_stat_failed;
+}
 #else  /* DS4_NO_GPU: every GLM-5.3 nextn cache hook is a no-op. */
 void ds4_test_glm_zero_mtp_caches(ds4_session *s) { (void)s; }
 int ds4_test_glm_mtp_cache_dims(ds4_session *s, uint32_t *kv_dim,
@@ -87394,6 +87976,34 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
     (void)s; (void)token; (void)start;
     (void)draft; (void)draft_logits; (void)draft_logits_cap;
     return 0;
+}
+void ds4_test_glm_mtp_ledger(ds4_session *s, int enable) {
+    (void)s; (void)enable;
+}
+int ds4_test_glm_mtp_ledger_slot(ds4_session *s, uint32_t pos,
+                                 uint32_t *token, uint32_t *hidden_pos) {
+    (void)s; (void)pos; (void)token; (void)hidden_pos;
+    return -1;
+}
+uint32_t ds4_test_glm_mtp_read_floor(ds4_session *s) {
+    (void)s;
+    return 0u;
+}
+int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
+                                int *hidden_kept) {
+    (void)s; (void)pos; (void)written; (void)hidden_kept;
+    return 0;
+}
+int ds4_test_glm_mtp_dense(ds4_session *s) {
+    (void)s;
+    return 0;
+}
+void ds4_test_glm_mtp_fail_next(ds4_session *s, int kind) {
+    (void)s; (void)kind;
+}
+void ds4_test_glm_mtp_stats(ds4_session *s, uint32_t *rewrites,
+                            uint32_t *replacements, uint32_t *failures) {
+    (void)s; (void)rewrites; (void)replacements; (void)failures;
 }
 #endif
 

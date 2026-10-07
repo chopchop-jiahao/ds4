@@ -511,6 +511,45 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
                                         uint32_t start, int *draft,
                                         float *draft_logits,
                                         uint32_t draft_logits_cap);
+/* Test helpers (ds4-test, ticket 005): per-slot bookkeeping of the GLM-5.3
+ * nextn (MTP) cache writes.  Everything here is off by default and costs
+ * nothing on the production path.
+ *   ledger     turn the per-slot ledger on/off (turning it on allocates and
+ *              clears it; it records every nextn slot write: the token the
+ *              write used and the absolute position of the trunk hidden it
+ *              used).  ledger_slot() reads one slot back: 1 = written, 0 =
+ *              never written, -1 = no ledger / slot out of range.  A chained
+ *              draft row records DS4_TEST_GLM_MTP_LEDGER_CHAIN as its hidden
+ *              position, a value no real position can have.
+ *   read_floor the first slot a draft may read: every slot below it is stale,
+ *              unknown or failed.  It only rises until a cold prefill.
+ *   dense      non-zero while the session maintains the nextn caches densely
+ *              (prefill fills them); zero for the legacy cycle, MTP off and
+ *              every unsupported configuration.
+ *   fail_next  make the next write of one kind fail exactly once, like the
+ *              GPU call failing.
+ *   stats      counters: rewrites caused by a differing token, exact-sampling
+ *              replacement writes, and failed nextn slot writes. */
+#define DS4_TEST_GLM_MTP_LEDGER_CHAIN 0xFFFFFFFEu
+#define DS4_TEST_GLM_MTP_FAIL_STEP      1  /* glm_graph_mtp_step() */
+#define DS4_TEST_GLM_MTP_FAIL_ROWS      2  /* glm53_graph_mtp_rows() catch-up */
+#define DS4_TEST_GLM_MTP_FAIL_FLUSH     3  /* seam rewrite with the real token */
+#define DS4_TEST_GLM_MTP_FAIL_FILL      4  /* prefill fill */
+#define DS4_TEST_GLM_MTP_FAIL_CHAIN     5  /* chained draft row */
+void ds4_test_glm_mtp_ledger(ds4_session *s, int enable);
+int ds4_test_glm_mtp_ledger_slot(ds4_session *s, uint32_t pos,
+                                 uint32_t *token, uint32_t *hidden_pos);
+uint32_t ds4_test_glm_mtp_read_floor(ds4_session *s);
+/* The checkpoint's last-slot bookkeeping: the position it describes, the token
+ * that slot holds (-1: never written or unknown), and whether the hidden a
+ * rewrite needs is still parked.  Returns 0 when the session has no GLM-5.3
+ * nextn caches. */
+int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
+                                int *hidden_kept);
+int ds4_test_glm_mtp_dense(ds4_session *s);
+void ds4_test_glm_mtp_fail_next(ds4_session *s, int kind);
+void ds4_test_glm_mtp_stats(ds4_session *s, uint32_t *rewrites,
+                            uint32_t *replacements, uint32_t *failures);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,

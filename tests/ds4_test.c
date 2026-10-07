@@ -8656,6 +8656,1051 @@ cleanup:
     free(file_text);
 }
 
+/* ------------------------------------------------------------------ *
+ * Ticket 005: every GLM-5.3 MTP slot holds (the real token at p+1, the
+ * main model's hidden at p).  The ledger records what every write put into
+ * a slot, so these tests check the invariant itself instead of a numeric
+ * fingerprint of one particular run.  Needs a GLM 5.3 model and
+ * DS4_TEST_GLM_MTP=1; --glm-mtp-commit-exact additionally needs
+ * DS4_TEST_MTP_EXACT=1.
+ * ------------------------------------------------------------------ */
+
+/* The invariant after every cycle, eval and rewind: over the readable history
+ * range H = [floor .. L-2] slot p holds the checkpoint's token p+1 written from
+ * the hidden of position p.  A dense session (the fast cycle, prefill fills
+ * from position 0) starts H at the read floor; the legacy cycle fills nothing
+ * before its draft window, so its H starts at the window start, and a window
+ * that was never decided means nothing has been written yet.  The last slot is
+ * free-form -- its next token does not exist yet -- but a write there can only
+ * have used that position's own hidden, and unless the floor passed it the
+ * session must still hold the hidden a rewrite needs. */
+static bool test_glm_mtp_commit_invariant(ds4_session *session, const char *label,
+                                          int step) {
+    const ds4_tokens *h = ds4_session_tokens(session);
+    if (!h || h->len <= 0) return true;
+    const uint32_t l = (uint32_t)h->len;
+    const uint32_t floor = ds4_test_glm_mtp_read_floor(session);
+    uint32_t start = 0;
+    const bool decided = ds4_session_glm_mtp_window_start(session, &start);
+    bool ok = true;
+    if (decided && start < floor) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s/%d window start %u below "
+                        "the read floor %u\n", label, step, start, floor);
+        ok = false;
+    }
+    uint32_t lo = ds4_test_glm_mtp_dense(session) ? floor
+                 : (decided ? start : l);
+    if (lo < floor) lo = floor;
+    for (uint32_t p = lo; p + 2u <= l; p++) {
+        uint32_t tok = 0, hid = 0;
+        const int r = ds4_test_glm_mtp_ledger_slot(session, p, &tok, &hid);
+        if (r != 1 || tok != (uint32_t)h->v[p + 1] || hid != p) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit %s/%d slot %u: %s "
+                            "token=%u hidden=%u, want token=%d hidden=%u\n",
+                    label, step, p,
+                    r == 1 ? "written" : (r == 0 ? "never written" : "no ledger"),
+                    tok, hid, h->v[p + 1], p);
+            ok = false;
+            break;
+        }
+    }
+    uint32_t spos = 0;
+    int swritten = -1, skept = 0;
+    if (ds4_test_glm_mtp_dense(session) && floor < l &&
+        ds4_test_glm_mtp_seam_state(session, &spos, &swritten, &skept) &&
+        (!skept || spos != l - 1u)) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s/%d last slot %u: seam pos %u "
+                        "hidden kept=%d, want the seam on the last slot with "
+                        "its hidden\n", label, step, l - 1u, spos, skept);
+        ok = false;
+    }
+    uint32_t tok = 0, hid = 0;
+    if (ds4_test_glm_mtp_ledger_slot(session, l - 1u, &tok, &hid) == 1 &&
+        hid != l - 1u && hid != DS4_TEST_GLM_MTP_LEDGER_CHAIN) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s/%d last slot %u was written "
+                        "from the hidden of position %u\n", label, step, l - 1u, hid);
+        ok = false;
+    }
+    if (!ok) fflush(stderr);
+    return ok;
+}
+
+/* One nextn KV row read back, and the max absolute difference of two rows. */
+static float *test_glm_mtp_commit_row(ds4_session *session, uint32_t slot,
+                                      uint32_t kv_dim) {
+    float *row = malloc((size_t)kv_dim * sizeof(float));
+    if (!row) return NULL;
+    if (!ds4_test_glm_read_mtp_kv(session, slot, row, kv_dim, NULL, 0, NULL, 0)) {
+        free(row);
+        return NULL;
+    }
+    return row;
+}
+
+static float test_glm_mtp_commit_abs(const float *a, const float *b, uint32_t n) {
+    float abs_max = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const float d = fabsf(a[i] - b[i]);
+        if (d > abs_max) abs_max = d;
+    }
+    return abs_max;
+}
+
+/* One speculative cycle: sampled cycles take the second-best token through the
+ * ignoring-EOS entry, the others the argmax through the ordinary greedy entry
+ * (so a sampled cycle's first token differs from what the drafter guessed by
+ * construction, and the ignore_eos path is covered).  Returns the number of
+ * committed tokens, or -1. */
+static int test_glm_mtp_commit_cycle(ds4_engine *engine, ds4_session *session,
+                                     const char *label, int cycle, bool sampled,
+                                     int room, int *accepted, int accepted_cap) {
+    char err[256] = {0};
+    const int eos = ds4_token_eos(engine);
+    int first = -1;
+    if (sampled) {
+        ds4_token_score top[8] = {0};
+        if (ds4_session_top_logprobs(session, top, 8) < 2 || top[1].id == top[0].id) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit %s: no second-best token\n", label);
+            return -1;
+        }
+        first = top[1].id;
+    } else {
+        first = ds4_session_argmax(session);
+    }
+    if (first < 0 || first == eos) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s: nothing to commit at cycle %d\n",
+                label, cycle);
+        return -1;
+    }
+    const int ntok = sampled
+        ? ds4_session_eval_speculative_argmax_ignoring_eos(
+              session, first, room, eos, DS4_THINK_NONE, accepted, accepted_cap,
+              err, sizeof(err))
+        : ds4_session_eval_speculative_argmax(session, first, room, eos, accepted,
+                                            accepted_cap, err, sizeof(err));
+    if (ntok < 1) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s cycle %d failed: %s\n", label,
+                cycle, err);
+        TEST_ASSERT(false);
+        return -1;
+    }
+    return ntok;
+}
+
+/* A committed block a rewind can roll back: the cycle that produced it has to
+ * be the last one, so the search stops on it. */
+typedef struct {
+    uint32_t block_start;
+    int toks[4];
+    int ntok;
+} test_glm_mtp_block;
+
+/* Mixed generation with the invariant after every cycle.  With strict set it
+ * keeps going until it committed min_tokens, rewrote at least one slot for a
+ * differing token and saw a multi-token commit, failing at the cap; otherwise it
+ * stops at min_tokens and only requires the invariant to have held. */
+static bool test_glm_mtp_commit_mixed(ds4_engine *engine, ds4_session *session,
+                                      const char *label, int min_tokens,
+                                      int max_tokens, bool strict) {
+    const int eos = ds4_token_eos(engine);
+    uint32_t base_rewrites = 0, base_repl = 0, base_fail = 0;
+    int committed = 0;
+    int widest = 0;
+    bool any = false;
+    ds4_test_glm_mtp_stats(session, &base_rewrites, &base_repl, &base_fail);
+    for (int cycle = 1; committed < max_tokens && cycle <= TEST_MTP_MAXGEN; cycle++) {
+        int accepted[4] = {0};
+        const int room = max_tokens - committed < 4 ? max_tokens - committed : 4;
+        const int ntok = test_glm_mtp_commit_cycle(engine, session, label, cycle,
+                                                  (cycle % 2) == 0, room, accepted,
+                                                  (int)(sizeof(accepted) /
+                                                        sizeof(accepted[0])));
+        if (ntok < 0) return false;
+        any = true;
+        if (ntok > widest) widest = ntok;
+        for (int i = 0; i < ntok; i++) {
+            if (accepted[i] == eos) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit %s: EOS after %d committed "
+                                "tokens (need %d)\n", label, committed, min_tokens);
+                return false;
+            }
+            committed++;
+        }
+        if (!test_glm_mtp_commit_invariant(session, label, cycle)) return false;
+        uint32_t rewrites = 0, repl = 0, fails = 0;
+        ds4_test_glm_mtp_stats(session, &rewrites, &repl, &fails);
+        if (committed >= min_tokens &&
+            (!strict || (rewrites > base_rewrites && widest >= 2))) {
+            return true;
+        }
+    }
+    if (!strict) return any;
+    fprintf(stderr, "ds4-test: glm-mtp-commit %s: cap reached with committed=%d "
+                    "(need %d), widest_commit=%d, rewrites=%u, replacements=%u, "
+                    "failures=%u\n", label, committed, min_tokens, widest,
+            base_rewrites, base_repl, base_fail);
+    return false;
+}
+
+/* Greedy cycles until one commits two or more tokens, stopping on that cycle so
+ * the block it committed is still the rewindable one. */
+static bool test_glm_mtp_commit_until_wide(ds4_engine *engine, ds4_session *session,
+                                           const char *label,
+                                           test_glm_mtp_block *block) {
+    const int eos = ds4_token_eos(engine);
+    for (int cycle = 1; cycle <= TEST_MTP_MAXGEN; cycle++) {
+        int accepted[4] = {0};
+        const int ntok = test_glm_mtp_commit_cycle(engine, session, label, cycle,
+                                                  false, 4, accepted,
+                                                  (int)(sizeof(accepted) /
+                                                        sizeof(accepted[0])));
+        if (ntok < 0) return false;
+        if (!test_glm_mtp_commit_invariant(session, label, cycle)) return false;
+        if (ntok >= 2) {
+            block->block_start = (uint32_t)ds4_session_pos(session) - (uint32_t)ntok;
+            block->ntok = ntok;
+            for (int i = 0; i < ntok && i < 4; i++) block->toks[i] = accepted[i];
+            return true;
+        }
+        for (int i = 0; i < ntok; i++) {
+            if (accepted[i] == eos) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit %s: EOS before a wide "
+                                "commit\n", label);
+                return false;
+            }
+        }
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-commit %s: no cycle committed two tokens "
+                    "in %d cycles\n", label, TEST_MTP_MAXGEN);
+    return false;
+}
+
+/* 1. A plain step whose slot is rewritten by the next request's first token.
+ * The rewritten row must sit closer to the row a session that only ever knew
+ * the real token writes than the row the drafter's guess left behind. */
+static bool test_glm_mtp_commit_plain_step(ds4_engine *engine,
+                                           const ds4_tokens *prompt, int ctx,
+                                           uint32_t kv_dim) {
+    char err[256] = {0};
+    const int eos = ds4_token_eos(engine);
+    ds4_session *a = NULL, *b = NULL;
+    ds4_tokens extended = {0};
+    float *row_pre = NULL, *row_post = NULL, *row_ref = NULL;
+    bool ok = ds4_session_create(&a, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) return false;
+    ds4_test_glm_zero_mtp_caches(a);
+    /* The ledger has to cover the prefill too, so it goes on before the sync. */
+    ds4_test_glm_mtp_ledger(a, 1);
+    ok = ds4_session_sync(a, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    const uint32_t m = (uint32_t)ds4_session_pos(a);
+
+    /* The first cycle has no pending draft, so it is the plain step: it writes
+     * slot M with the token it guessed for position M+1. */
+    const int t0 = ds4_session_argmax(a);
+    int accepted[4] = {0};
+    int ntok = ds4_session_eval_speculative_argmax(a, t0, 4, eos, accepted, 4,
+                                                  err, sizeof(err));
+    TEST_ASSERT(ntok == 1);
+    if (ntok != 1) goto cleanup;
+    if (!test_glm_mtp_commit_invariant(a, "plain-step", 1)) goto cleanup;
+    row_pre = test_glm_mtp_commit_row(a, m, kv_dim);
+    TEST_ASSERT(row_pre != NULL && test_glm_mtp_row_written(row_pre, kv_dim));
+    if (!row_pre) goto cleanup;
+
+    /* The next request starts with a token that is not that guess. */
+    ds4_token_score top[8] = {0};
+    TEST_ASSERT(ds4_session_top_logprobs(a, top, 8) == 8);
+    const int x = top[1].id;
+    TEST_ASSERT(x != top[0].id);
+    ntok = ds4_session_eval_speculative_argmax(a, x, 4, eos, accepted, 4,
+                                              err, sizeof(err));
+    TEST_ASSERT(ntok >= 1);
+    if (ntok < 1) goto cleanup;
+    if (!test_glm_mtp_commit_invariant(a, "plain-step", 2)) goto cleanup;
+    uint32_t tok = 0, hid = 0;
+    const int r = ds4_test_glm_mtp_ledger_slot(a, m, &tok, &hid);
+    fprintf(stderr, "ds4-test: glm-mtp-commit plain-step: slot %u after the "
+                    "differing first token: ledger=%d token=%u hidden=%u want "
+                    "token=%d\n", m, r, tok, hid, x);
+    TEST_ASSERT(r == 1 && tok == (uint32_t)x && hid == m);
+    row_post = test_glm_mtp_commit_row(a, m, kv_dim);
+    TEST_ASSERT(row_post != NULL);
+    if (!row_post) goto cleanup;
+
+    /* Reference: the same prompt, then the real token as its own resumed
+     * request, then the very plain step the fast cycle runs after a decode. */
+    ok = ds4_session_create(&b, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    ds4_test_glm_zero_mtp_caches(b);
+    ok = ds4_session_sync(b, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    for (int i = 0; i < prompt->len; i++) ds4_tokens_push(&extended, prompt->v[i]);
+    ds4_tokens_push(&extended, t0);
+    ok = ds4_session_sync(b, &extended, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    TEST_ASSERT((uint32_t)ds4_session_pos(b) == m + 1u);
+    TEST_ASSERT(ds4_test_glm_mtp_draft_after_decode(b, x, m, NULL, NULL, 0));
+    row_ref = test_glm_mtp_commit_row(b, m, kv_dim);
+    TEST_ASSERT(row_ref != NULL);
+    if (!row_ref) goto cleanup;
+
+    const float post_abs = test_glm_mtp_commit_abs(row_post, row_ref, kv_dim);
+    const float pre_abs = test_glm_mtp_commit_abs(row_pre, row_ref, kv_dim);
+    fprintf(stderr, "ds4-test: glm-mtp-commit plain-step slot %u vs the real "
+                    "token: rewritten max_abs=%.6g, predicted max_abs=%.6g\n",
+            m, post_abs, pre_abs);
+    /* Ordering, not a numeric threshold (004 section 2, point 6). */
+    TEST_ASSERT(post_abs < pre_abs);
+    ok = true;
+
+cleanup:
+    ds4_tokens_free(&extended);
+    free(row_ref);
+    free(row_post);
+    free(row_pre);
+    ds4_session_free(b);
+    ds4_session_free(a);
+    return ok;
+}
+
+/* 3. The server's resample flow: rewind a committed block to its last kept
+ * token and evaluate a different one.  The slot the rewind uncovers was written
+ * with the dropped token, so the eval has to rewrite it. */
+static bool test_glm_mtp_commit_resample(ds4_engine *engine, ds4_session *session,
+                                         const test_glm_mtp_block *block,
+                                         bool same_token, uint32_t kv_dim,
+                                         const char *label) {
+    char err[256] = {0};
+    const uint32_t slot = block->block_start + (uint32_t)block->ntok - 2u;
+    const int dropped = block->toks[block->ntok - 1];
+    ds4_session *ref = NULL;
+    ds4_tokens prefix = {0};
+    float *row_pre = NULL, *row_post = NULL, *row_ref = NULL;
+    uint32_t rewrites_before = 0, repl_before = 0, fails_before = 0;
+    uint32_t rewrites_after = 0, repl_after = 0, fails_after = 0;
+    ds4_test_glm_mtp_stats(session, &rewrites_before, &repl_before, &fails_before);
+    row_pre = test_glm_mtp_commit_row(session, slot, kv_dim);
+    TEST_ASSERT(row_pre != NULL && test_glm_mtp_row_written(row_pre, kv_dim));
+    if (!row_pre) return false;
+    const ds4_tokens *history = ds4_session_tokens(session);
+    for (int i = 0; i < (int)(block->block_start + (uint32_t)block->ntok - 1u); i++) {
+        ds4_tokens_push(&prefix, history->v[i]);
+    }
+
+    ds4_session_rewind(session, (int)(block->block_start + (uint32_t)block->ntok - 1u));
+    if (ds4_session_pos(session) != (int)(block->block_start + (uint32_t)block->ntok - 1u)) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s: rewind left pos %d, want %u\n",
+                label, ds4_session_pos(session),
+                block->block_start + block->ntok - 1u);
+        TEST_ASSERT(false);
+        ds4_tokens_free(&prefix);
+        free(row_pre);
+        return false;
+    }
+    int y = dropped;
+    if (!same_token) {
+        ds4_token_score top[8] = {0};
+        TEST_ASSERT(ds4_session_top_logprobs(session, top, 8) == 8);
+        y = top[1].id;
+        if (y == dropped) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit %s: the second-best token "
+                            "is the dropped one\n", label);
+            TEST_ASSERT(false);
+            ds4_tokens_free(&prefix);
+            free(row_pre);
+            return false;
+        }
+    }
+    if (ds4_session_eval(session, y, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s: resample eval failed: %s\n",
+                label, err);
+        TEST_ASSERT(false);
+        ds4_tokens_free(&prefix);
+        free(row_pre);
+        return false;
+    }
+    ds4_test_glm_mtp_stats(session, &rewrites_after, &repl_after, &fails_after);
+    fprintf(stderr, "ds4-test: glm-mtp-commit %s: slot %u %d -> %d, rewrites "
+                    "%u -> %u, failures %u -> %u\n", label, slot, dropped, y,
+            rewrites_before, rewrites_after, fails_before, fails_after);
+    if (!test_glm_mtp_commit_invariant(session, label, 900)) {
+        ds4_tokens_free(&prefix);
+        free(row_pre);
+        return false;
+    }
+    uint32_t tok = 0, hid = 0;
+    const int r = ds4_test_glm_mtp_ledger_slot(session, slot, &tok, &hid);
+    TEST_ASSERT(r == 1 && tok == (uint32_t)y && hid == slot);
+    if (same_token) {
+        /* Re-evaluating the very token that was dropped must cost nothing. */
+        TEST_ASSERT(rewrites_after == rewrites_before);
+        TEST_ASSERT(fails_after == fails_before);
+        ds4_tokens_free(&prefix);
+        free(row_pre);
+        return true;
+    }
+    /* A differing token has to cost exactly one rewrite. */
+    TEST_ASSERT(rewrites_after == rewrites_before + 1u);
+    TEST_ASSERT(fails_after == fails_before);
+
+    /* Reference: the same committed prefix, then the plain step that writes the
+     * last slot with the resampled token. */
+    bool ok = ds4_session_create(&ref, engine, ds4_session_ctx(session)) == 0;
+    TEST_ASSERT(ok);
+    if (ok) ok = ds4_session_sync(ref, &prefix, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (ok) ok = ds4_test_glm_mtp_draft_after_decode(ref, y, slot, NULL, NULL, 0) != 0;
+    TEST_ASSERT(ok);
+    if (ok) row_ref = test_glm_mtp_commit_row(ref, slot, kv_dim);
+    if (ok) row_post = test_glm_mtp_commit_row(session, slot, kv_dim);
+    ok = row_ref != NULL && row_post != NULL;
+    TEST_ASSERT(ok);
+    if (ok) {
+        const float post_abs = test_glm_mtp_commit_abs(row_post, row_ref, kv_dim);
+        const float pre_abs = test_glm_mtp_commit_abs(row_pre, row_ref, kv_dim);
+        fprintf(stderr, "ds4-test: glm-mtp-commit %s slot %u vs the resampled "
+                        "token: rewritten max_abs=%.6g, dropped-token row "
+                        "max_abs=%.6g\n", label, slot, post_abs, pre_abs);
+        TEST_ASSERT(post_abs < pre_abs);
+    }
+    ds4_session_free(ref);
+    ds4_tokens_free(&prefix);
+    free(row_ref);
+    free(row_post);
+    free(row_pre);
+    return ok;
+}
+
+/* 4. Decode without ever entering a cycle: every plain eval is a one-token
+ * continuation, so it fills the slot the previous row left and leaves its own
+ * row waiting.  Returns the mean milliseconds per eval; the ledger and the
+ * invariant only run with MTP on (the closed case is the timing reference). */
+static double test_glm_mtp_commit_plain_eval(ds4_engine *engine,
+                                             const ds4_tokens *prompt, int ctx,
+                                             bool mtp_on, uint32_t kv_dim,
+                                             int *steps_out) {
+    char err[256] = {0};
+    ds4_session *session = NULL;
+    bool ok = ds4_session_create(&session, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) return 0.0;
+    if (mtp_on) {
+        ds4_test_glm_zero_mtp_caches(session);
+        ds4_test_glm_mtp_ledger(session, 1);
+    }
+    ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) { ds4_session_free(session); return 0.0; }
+    const uint32_t m = (uint32_t)ds4_session_pos(session);
+    const uint32_t floor0 = ds4_test_glm_mtp_read_floor(session);
+    double elapsed = 0.0;
+    int steps = 0;
+    for (int i = 0; i < TEST_GLM_MTP_WINDOW_MIN_TOKENS; i++) {
+        const int t = ds4_session_argmax(session);
+        if (t < 0) break;
+        const double t0 = test_monotonic_seconds();
+        ok = ds4_session_eval(session, t, err, sizeof(err)) == 0;
+        elapsed += test_monotonic_seconds() - t0;
+        TEST_ASSERT(ok);
+        if (!ok) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval step %d: %s\n", i, err);
+            break;
+        }
+        steps++;
+        if (mtp_on) {
+            if (!test_glm_mtp_commit_invariant(session, "plain-eval", i + 1)) break;
+            if (ds4_test_glm_mtp_read_floor(session) != floor0) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: the read "
+                                "floor rose to %u without a failure\n",
+                        ds4_test_glm_mtp_read_floor(session));
+                TEST_ASSERT(false);
+                break;
+            }
+        }
+    }
+    if (mtp_on && ok && ds4_test_glm_mtp_dense(session)) {
+        for (uint32_t p = m; p + 1u < m + (uint32_t)steps; p++) {
+            float *row = test_glm_mtp_commit_row(session, p, kv_dim);
+            const bool written = row != NULL && test_glm_mtp_row_written(row, kv_dim) &&
+                                 test_glm_mtp_row_finite(row, kv_dim);
+            if (!written) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: slot %u is "
+                                "not a written row\n", p);
+                TEST_ASSERT(false);
+            }
+            free(row);
+            if (!written) { ok = false; break; }
+        }
+    }
+    if (mtp_on && ok) {
+        /* A few mixed cycles on top of the plain decode must hold too. */
+        ok = test_glm_mtp_commit_mixed(engine, session, "plain-eval+cycles", 4, 12,
+                                      false);
+        TEST_ASSERT(ok);
+    }
+    ds4_session_free(session);
+    if (steps_out) *steps_out = steps;
+    return steps > 0 ? elapsed * 1000.0 / (double)steps : 0.0;
+}
+
+static void test_glm_mtp_commit_token(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine)) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-token skipped (needs a GLM 5.3 "
+                        "model)\n");
+        return;
+    }
+    const bool mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    int ctx = (int)test_env_u32("DS4_TEST_GLM_MTP_WINDOW_CTX");
+    if (ctx < 4096) ctx = 4096;
+
+    if (!mtp) {
+        /* MTP off: the same plain-decode timing, with no ledger and no new
+         * work, as the reference for the numbers above. */
+        ds4_tokens prompt = {0};
+        ds4_chat_begin(engine, &prompt);
+        ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+        ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+        int steps = 0;
+        const double ms = test_glm_mtp_commit_plain_eval(engine, &prompt, ctx, false,
+                                                        0u, &steps);
+        fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval (MTP off): steps=%d "
+                        "mean=%.3f ms\n", steps, ms);
+        ds4_tokens_free(&prompt);
+        return;
+    }
+
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    TEST_ASSERT(prompt.len + TEST_MTP_MAXGEN + 64 < ctx);
+
+    uint32_t kv_dim = 0, pool_dim = 0, pool_size = 0, tail_dim = 0, cap = 0;
+    ds4_session *probe = NULL;
+    bool ok = ds4_session_create(&probe, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (ok) {
+        ds4_test_glm_zero_mtp_caches(probe);
+        ok = ds4_test_glm_mtp_cache_dims(probe, &kv_dim, &pool_dim, &pool_size,
+                                        &tail_dim, &cap) != 0;
+        TEST_ASSERT(ok);
+    }
+    ds4_session_free(probe);
+    if (!ok) { ds4_tokens_free(&prompt); return; }
+
+    ok = test_glm_mtp_commit_plain_step(engine, &prompt, ctx, kv_dim);
+    TEST_ASSERT(ok);
+
+    /* 2. mixed generation, then 3. the server's resample flow on the same
+     * session, first with a different token and then with the kept one. */
+    ds4_session *a2 = NULL;
+    ok = ds4_session_create(&a2, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (ok) {
+        char err[256] = {0};
+        ds4_test_glm_zero_mtp_caches(a2);
+        ds4_test_glm_mtp_ledger(a2, 1);
+        ok = ds4_session_sync(a2, &prompt, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        ok = test_glm_mtp_commit_mixed(engine, a2, "mixed",
+                                      TEST_GLM_MTP_WINDOW_MIN_TOKENS,
+                                      TEST_MTP_MAXGEN, true);
+        TEST_ASSERT(ok);
+    }
+    if (ok) {
+        test_glm_mtp_block block = {0};
+        ok = test_glm_mtp_commit_until_wide(engine, a2, "resample", &block);
+        TEST_ASSERT(ok);
+        if (ok) {
+            ok = test_glm_mtp_commit_resample(engine, a2, &block, false, kv_dim,
+                                             "resample");
+            TEST_ASSERT(ok);
+        }
+    }
+    if (ok) {
+        /* And again with the token the server actually kept: the slot already
+         * holds it, so nothing may be rewritten. */
+        test_glm_mtp_block block = {0};
+        ok = test_glm_mtp_commit_until_wide(engine, a2, "resample-same", &block);
+        TEST_ASSERT(ok);
+        if (ok) {
+            ok = test_glm_mtp_commit_resample(engine, a2, &block, true, kv_dim,
+                                             "resample-same");
+            TEST_ASSERT(ok);
+        }
+    }
+    if (a2) ds4_session_free(a2);
+
+    /* 4. plain decode, with the timing both modes print. */
+    int steps = 0;
+    const double ms = test_glm_mtp_commit_plain_eval(engine, &prompt, ctx, true,
+                                                    kv_dim, &steps);
+    fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: steps=%d mean=%.3f ms\n",
+            steps, ms);
+    ds4_tokens_free(&prompt);
+}
+
+/* --glm-mtp-commit-exact: the exact-sampling reject replaces the draft with a
+ * residual sample, which is a committed token the slot has to learn. */
+static void test_glm_mtp_commit_exact(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-exact skipped (needs a GLM 5.3 "
+                        "model and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+    if (!test_env_bool("DS4_TEST_MTP_EXACT") || !ds4_engine_mtp_exact_sampling(engine)) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-exact skipped (needs "
+                        "DS4_TEST_MTP_EXACT=1)\n");
+        return;
+    }
+    int ctx = (int)test_env_u32("DS4_TEST_GLM_MTP_WINDOW_CTX");
+    if (ctx < 4096) ctx = 4096;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens prefix = {0};
+    ds4_session *session = NULL, *ref = NULL;
+    float *row = NULL, *row_ref = NULL;
+    char err[256] = {0};
+    uint64_t rng = 20250705u;
+    const int eos = ds4_token_eos(engine);
+    uint32_t kv_dim = 0, pool_dim = 0, pool_size = 0, tail_dim = 0, cap = 0;
+
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    ds4_session *probe = NULL;
+    bool ok = ds4_session_create(&probe, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (ok) {
+        ds4_test_glm_zero_mtp_caches(probe);
+        ok = ds4_test_glm_mtp_cache_dims(probe, &kv_dim, &pool_dim, &pool_size,
+                                        &tail_dim, &cap) != 0;
+        TEST_ASSERT(ok);
+    }
+    ds4_session_free(probe);
+    if (!ok) goto cleanup;
+
+    ok = ds4_session_create(&session, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    ds4_test_glm_zero_mtp_caches(session);
+    ds4_test_glm_mtp_ledger(session, 1);
+    ok = ds4_session_sync(session, &prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    uint32_t replacements = 0, rewrites = 0, failures = 0;
+    int block_start = -1;
+    int replacement = -1;
+    int kept[4] = {0};
+    int ntok_last = 0;
+    for (int cycle = 0; cycle < TEST_MTP_MAXGEN && replacements == 0; cycle++) {
+        const int first = ds4_session_sample(session, DS4_DEFAULT_TEMPERATURE, 0,
+                                            DS4_DEFAULT_TOP_P, DS4_DEFAULT_MIN_P,
+                                            &rng);
+        if (first < 0 || first == eos) break;
+        int accepted[4] = {0};
+        block_start = ds4_session_pos(session);
+        const int ntok = ds4_session_eval_speculative(
+            session, first, 4, eos, DS4_DEFAULT_TEMPERATURE, 0,
+            DS4_DEFAULT_TOP_P, DS4_DEFAULT_MIN_P, &rng, accepted, 4,
+            err, sizeof(err));
+        if (ntok < 1) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit-exact cycle %d failed: %s\n",
+                    cycle, err);
+            TEST_ASSERT(false);
+            ok = false;
+            break;
+        }
+        if (!test_glm_mtp_commit_invariant(session, "exact", cycle + 1)) {
+            ok = false;
+            break;
+        }
+        ds4_test_glm_mtp_stats(session, &rewrites, &replacements, &failures);
+        if (replacements > 0 && ntok == 2) {
+            /* the cycle that replaced its draft: accepted[1] is the replacement */
+            replacement = accepted[1];
+            for (int i = 0; i < ntok; i++) kept[i] = accepted[i];
+            ntok_last = ntok;
+        }
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-commit-exact: replacements=%u rewrites=%u "
+                    "failures=%u slot=%d token=%d\n", replacements, rewrites,
+            failures, block_start, replacement);
+    if (replacements == 0) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-exact: no exact-sampling "
+                        "replacement happened in %d cycles\n", TEST_MTP_MAXGEN);
+        TEST_ASSERT(false);
+        ok = false;
+        goto cleanup;
+    }
+    if (replacement < 0 || ntok_last < 2) {
+        /* A replacement committed inside a longer commit: the invariant above
+         * already covered it, but there is no single slot to point at. */
+        fprintf(stderr, "ds4-test: glm-mtp-commit-exact: the replacement was not a "
+                        "two-token commit; checked by the invariant only\n");
+        goto cleanup_resample;
+    }
+    ok = true;
+    {
+        const uint32_t slot = (uint32_t)block_start;
+        uint32_t tok = 0, hid = 0;
+        const int r = ds4_test_glm_mtp_ledger_slot(session, slot, &tok, &hid);
+        fprintf(stderr, "ds4-test: glm-mtp-commit-exact: slot %u ledger=%d "
+                        "token=%u hidden=%u want token=%d hidden=%u\n",
+                slot, r, tok, hid, replacement, slot);
+        TEST_ASSERT(r == 1 && tok == (uint32_t)replacement && hid == slot);
+        ok = r == 1 && tok == (uint32_t)replacement && hid == slot;
+        if (!ok) goto cleanup;
+        const ds4_tokens *history = ds4_session_tokens(session);
+        for (int i = 0; i < (int)(slot + 1u); i++) ds4_tokens_push(&prefix, history->v[i]);
+        ok = ds4_session_create(&ref, engine, ctx) == 0;
+        TEST_ASSERT(ok);
+        if (ok) ok = ds4_session_sync(ref, &prefix, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+        if (ok) {
+            ok = ds4_test_glm_mtp_draft_after_decode(ref, replacement, slot, NULL,
+                                                    NULL, 0) != 0;
+        }
+        TEST_ASSERT(ok);
+        if (ok) row = test_glm_mtp_commit_row(session, slot, kv_dim);
+        if (ok) row_ref = test_glm_mtp_commit_row(ref, slot, kv_dim);
+        ok = row != NULL && row_ref != NULL;
+        TEST_ASSERT(ok);
+        if (ok) {
+            const float abs_max = test_glm_mtp_commit_abs(row, row_ref, kv_dim);
+            fprintf(stderr, "ds4-test: glm-mtp-commit-exact: slot %u vs the plain "
+                            "step with the replacement: max_abs=%.6g\n", slot, abs_max);
+            /* No threshold this round: finite and written is all the spec asks
+             * for; the ordering check lives in --glm-mtp-commit-token. */
+            TEST_ASSERT(test_glm_mtp_row_finite(row, kv_dim) &&
+                        test_glm_mtp_row_written(row, kv_dim) &&
+                        test_glm_mtp_row_finite(row_ref, kv_dim));
+        }
+    }
+cleanup_resample:
+    if (ok && ntok_last >= 2 && replacement >= 0) {
+        /* The server's resample flow on top of the replacement cycle. */
+        test_glm_mtp_block block = {0};
+        block.block_start = (uint32_t)block_start;
+        block.ntok = ntok_last;
+        for (int i = 0; i < ntok_last && i < 4; i++) block.toks[i] = kept[i];
+        ok = test_glm_mtp_commit_resample(engine, session, &block, true, kv_dim,
+                                         "exact-resample");
+        TEST_ASSERT(ok);
+    }
+cleanup:
+    ds4_session_free(ref);
+    ds4_session_free(session);
+    ds4_tokens_free(&prefix);
+    ds4_tokens_free(&prompt);
+    free(row_ref);
+    free(row);
+}
+
+/* --glm-mtp-commit-fail: a nextn write that fails must make that slot (and
+ * everything below it) unreadable, must not fail the request, and must not
+ * happen again on the cycles that follow. */
+static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
+                                          const ds4_tokens *prompt, int ctx,
+                                          int kind, const char *label) {
+    char err[256] = {0};
+    const int eos = ds4_token_eos(engine);
+    ds4_session *session = NULL;
+    bool ok = ds4_session_create(&session, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) return;
+    ds4_test_glm_zero_mtp_caches(session);
+    ds4_test_glm_mtp_ledger(session, 1);
+    if (kind == DS4_TEST_GLM_MTP_FAIL_FILL) {
+        /* The prefill fill runs inside the sync, so this one goes in first. */
+        ds4_test_glm_mtp_fail_next(session, kind);
+    }
+    ok = ds4_session_sync(session, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s: sync failed: %s\n",
+                label, err);
+        ds4_session_free(session);
+        return;
+    }
+    uint32_t rewrites = 0, repl = 0, failures = 0;
+    ds4_test_glm_mtp_stats(session, &rewrites, &repl, &failures);
+    if (kind != DS4_TEST_GLM_MTP_FAIL_FILL) ds4_test_glm_mtp_fail_next(session, kind);
+
+    /* Run cycles until the armed write is the one that fails.  A draft chain
+     * only continues while the server's token is the one the drafter based its
+     * next draft on, so a rewrite for a differing token needs the second-best
+     * token -- and that is the only kind of cycle a seam rewrite happens in.
+     * Every other kind fires in the greedy chain: the plain step, the verify
+     * pass and the catch-up rows it ends with, the chained draft row. */
+    const bool sampled = kind == DS4_TEST_GLM_MTP_FAIL_FLUSH;
+    const uint32_t floor_before = ds4_test_glm_mtp_read_floor(session);
+    int cycle_at_failure = (kind == DS4_TEST_GLM_MTP_FAIL_FILL) ? 0 : -1;
+    uint32_t pos_at_failure = 0;
+    if (kind == DS4_TEST_GLM_MTP_FAIL_FILL) {
+        /* The failed range is inside the prefill, so the floor must have moved
+         * past at least one slot and stayed inside the prompt. */
+        ds4_test_glm_mtp_stats(session, &rewrites, &repl, &failures);
+        if (failures == 0) cycle_at_failure = -1;
+    }
+    for (int cycle = 1; cycle <= TEST_MTP_MAXGEN && failures == 0; cycle++) {
+        int first = -1;
+        if (sampled) {
+            ds4_token_score top[8] = {0};
+            if (ds4_session_top_logprobs(session, top, 8) < 2 ||
+                top[1].id == top[0].id) break;
+            first = top[1].id;
+        } else {
+            first = ds4_session_argmax(session);
+        }
+        if (first < 0 || first == eos) break;
+        int accepted[4] = {0};
+        pos_at_failure = (uint32_t)ds4_session_pos(session);
+        const int ntok = sampled
+            ? ds4_session_eval_speculative_argmax_ignoring_eos(
+                  session, first, 4, eos, DS4_THINK_NONE, accepted, 4,
+                  err, sizeof(err))
+            : ds4_session_eval_speculative_argmax(session, first, 4, eos, accepted, 4,
+                                                 err, sizeof(err));
+        if (ntok < 1) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s cycle %d failed: %s\n",
+                    label, cycle, err);
+            TEST_ASSERT(false);
+            ok = false;
+            break;
+        }
+        ds4_test_glm_mtp_stats(session, &rewrites, &repl, &failures);
+        if (failures > 0) {
+            cycle_at_failure = cycle;
+            /* The failed round still commits its tokens and still succeeds. */
+            TEST_ASSERT(ntok >= 1);
+        }
+        if (!test_glm_mtp_commit_invariant(session, label, cycle)) {
+            ok = false;
+            break;
+        }
+    }
+    if (kind == DS4_TEST_GLM_MTP_FAIL_FILL) {
+        pos_at_failure = 0;
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s: cycle=%d failures=%u floor "
+                    "%u -> %u at slot %u\n", label, cycle_at_failure, failures,
+            floor_before, ds4_test_glm_mtp_read_floor(session), pos_at_failure);
+    TEST_ASSERT(failures == 1);
+    TEST_ASSERT(cycle_at_failure >= 0);
+    ok = failures == 1 && cycle_at_failure >= 0;
+    if (kind == DS4_TEST_GLM_MTP_FAIL_CHAIN) {
+        /* A chained draft row is overwritten before anything reads it, so the
+         * floor must not move and the next cycle runs as usual. */
+        TEST_ASSERT(ds4_test_glm_mtp_read_floor(session) == floor_before);
+        ok = ok && ds4_test_glm_mtp_read_floor(session) == floor_before;
+    } else {
+        const uint32_t failed_slot = kind == DS4_TEST_GLM_MTP_FAIL_FLUSH
+                                     ? (pos_at_failure > 0 ? pos_at_failure - 1u : 0u)
+                                     : pos_at_failure;
+        TEST_ASSERT(ds4_test_glm_mtp_read_floor(session) > failed_slot);
+        ok = ok && ds4_test_glm_mtp_read_floor(session) > failed_slot;
+    }
+    if (ok) {
+        /* Keep generating: the invariant holds from the new floor and the floor
+         * never rises again without another failure. */
+        const uint32_t floor_after = ds4_test_glm_mtp_read_floor(session);
+        uint32_t start = 0;
+        if (ds4_session_glm_mtp_window_start(session, &start)) {
+            TEST_ASSERT(start >= floor_after);
+            ok = ok && start >= floor_after;
+        }
+        int committed = 0;
+        for (int cycle = 1; ok && committed < TEST_GLM_MTP_WINDOW_MIN_TOKENS &&
+                            cycle <= TEST_MTP_MAXGEN; cycle++) {
+            const int first = ds4_session_argmax(session);
+            if (first < 0 || first == eos) break;
+            int accepted[4] = {0};
+            const int ntok = ds4_session_eval_speculative_argmax(
+                session, first, 4, eos, accepted, 4, err, sizeof(err));
+            if (ntok < 1) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s recovery cycle %d "
+                                "failed: %s\n", label, cycle, err);
+                TEST_ASSERT(false);
+                ok = false;
+                break;
+            }
+            for (int i = 0; i < ntok; i++) {
+                if (accepted[i] == eos) {
+                    committed = TEST_GLM_MTP_WINDOW_MIN_TOKENS;
+                    break;
+                }
+                committed++;
+            }
+            if (!test_glm_mtp_commit_invariant(session, label, 500 + cycle)) {
+                ok = false;
+                break;
+            }
+            if (ds4_test_glm_mtp_read_floor(session) != floor_after) {
+                fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s: the floor rose "
+                                "to %u without a failure\n", label,
+                        ds4_test_glm_mtp_read_floor(session));
+                TEST_ASSERT(false);
+                ok = false;
+                break;
+            }
+        }
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s: recovered with %d "
+                        "tokens at floor %u\n", label, committed, floor_after);
+    }
+    ds4_session_free(session);
+}
+
+static void test_glm_mtp_commit_fail_load(ds4_engine *engine,
+                                          const ds4_tokens *prompt, int ctx) {
+    char err[256] = {0};
+    const int eos = ds4_token_eos(engine);
+    ds4_session *live = NULL, *restored = NULL;
+    ds4_tokens next = {0};
+    int committed = 0;
+    FILE *fp = NULL;
+    bool ok = ds4_session_create(&live, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) return;
+    ds4_test_glm_zero_mtp_caches(live);
+    ok = ds4_session_sync(live, prompt, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) goto cleanup;
+    ok = ds4_session_save_payload(live, fp, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    const long bytes = ftell(fp);
+    TEST_ASSERT(bytes > 0);
+    fflush(fp);
+    rewind(fp);
+    ds4_session_free(live);
+    live = NULL;
+    ok = ds4_session_create(&restored, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+    /* The ledger goes on before the load: the invariant below only walks slots
+     * the restored session writes itself, at or above the floor the load left. */
+    ds4_test_glm_zero_mtp_caches(restored);
+    ds4_test_glm_mtp_ledger(restored, 1);
+    ok = ds4_session_load_payload(restored, fp, (uint64_t)bytes, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: %s\n", err);
+        goto cleanup;
+    }
+    /* A restored session has no hidden for its last position, so nothing it
+     * restored is readable until the payload carries one (ticket 005). */
+    const uint32_t floor = ds4_test_glm_mtp_read_floor(restored);
+    fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: pos=%d floor=%u\n",
+            ds4_session_pos(restored), floor);
+    TEST_ASSERT(floor >= (uint32_t)ds4_session_pos(restored));
+    ok = floor >= (uint32_t)ds4_session_pos(restored);
+    for (int i = 0; ok && i < prompt->len; i++) ds4_tokens_push(&next, prompt->v[i]);
+    ds4_tokens_push(&next, ds4_session_argmax(restored));
+    ok = ds4_session_sync(restored, &next, err, sizeof(err)) == 0;
+    TEST_ASSERT(ok);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: continuation: %s\n", err);
+        goto cleanup;
+    }
+    for (int cycle = 0; ok && cycle < 8; cycle++) {
+        const int first = ds4_session_argmax(restored);
+        if (first < 0 || first == eos) break;
+        int accepted[4] = {0};
+        const int ntok = ds4_session_eval_speculative_argmax(
+            restored, first, 4, eos, accepted, 4, err, sizeof(err));
+        ok = ntok >= 1;
+        TEST_ASSERT(ok);
+        if (!ok) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: cycle %d: %s\n",
+                    cycle, err);
+            break;
+        }
+        /* Everything at or above the floor the load left is trustworthy, and
+         * nothing below it enters the draft window. */
+        if (!test_glm_mtp_commit_invariant(restored, "load", cycle + 1)) {
+            ok = false;
+            break;
+        }
+        committed += ntok;
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: floor %u after %d "
+                    "committed tokens\n", ds4_test_glm_mtp_read_floor(restored),
+            committed);
+
+cleanup:
+    if (fp) fclose(fp);
+    ds4_tokens_free(&next);
+    ds4_session_free(restored);
+    ds4_session_free(live);
+}
+
+static void test_glm_mtp_commit_fail(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail skipped (needs a GLM 5.3 "
+                        "model and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+    const char *depth = getenv("DS4_GLM_MTP_DEPTH");
+    const bool depth3 = depth && depth[0] && atoi(depth) == 3;
+    int ctx = (int)test_env_u32("DS4_TEST_GLM_MTP_WINDOW_CTX");
+    if (ctx < 4096) ctx = 4096;
+    ds4_tokens prompt = {0};
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user", test_mtp_copy_prompt());
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(prompt.len > 0);
+    TEST_ASSERT(prompt.len + TEST_MTP_MAXGEN + 64 < ctx);
+
+    uint32_t kv_dim = 0, pool_dim = 0, pool_size = 0, tail_dim = 0, cap = 0;
+    ds4_session *probe = NULL;
+    bool ok = ds4_session_create(&probe, engine, ctx) == 0;
+    TEST_ASSERT(ok);
+    if (ok) {
+        ds4_test_glm_zero_mtp_caches(probe);
+        ok = ds4_test_glm_mtp_cache_dims(probe, &kv_dim, &pool_dim, &pool_size,
+                                        &tail_dim, &cap) != 0;
+        TEST_ASSERT(ok);
+    }
+    ds4_session_free(probe);
+    if (!ok) { ds4_tokens_free(&prompt); return; }
+
+    test_glm_mtp_commit_fail_kind(engine, &prompt, ctx, DS4_TEST_GLM_MTP_FAIL_STEP,
+                                 "step");
+    test_glm_mtp_commit_fail_kind(engine, &prompt, ctx, DS4_TEST_GLM_MTP_FAIL_ROWS,
+                                 "rows");
+    test_glm_mtp_commit_fail_kind(engine, &prompt, ctx, DS4_TEST_GLM_MTP_FAIL_FLUSH,
+                                 "flush");
+    test_glm_mtp_commit_fail_kind(engine, &prompt, ctx, DS4_TEST_GLM_MTP_FAIL_FILL,
+                                 "fill");
+    if (!depth3) {
+        fprintf(stderr, "ds4-test: glm-mtp-commit-fail chain skipped (run with "
+                        "DS4_GLM_MTP_DEPTH=3)\n");
+    } else {
+        test_glm_mtp_commit_fail_kind(engine, &prompt, ctx, DS4_TEST_GLM_MTP_FAIL_CHAIN,
+                                     "chain");
+    }
+    test_glm_mtp_commit_fail_load(engine, &prompt, ctx);
+    ds4_tokens_free(&prompt);
+}
+
 /* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
  * is separate from the fixture because it teacher-forces every committed token
  * through normal decode and directly checks that DSpark never commits a token
@@ -8754,6 +9799,9 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
     {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP drafts from the current request's first generated position after a resume or a disk-KV restore", test_glm_mtp_request_window},
     {"--glm-mtp-prefill", "glm-mtp-prefill", "GLM 5.3 MTP prefill writes the nextn KV and indexer caches, and the seam fills the row that waits for its token", test_glm_mtp_prefill_write},
+    {"--glm-mtp-commit-token", "glm-mtp-commit-token", "GLM 5.3 MTP slots hold the real committed token and their own position's hidden across plain steps, mixed sampling and resample rewinds", test_glm_mtp_commit_token},
+    {"--glm-mtp-commit-exact", "glm-mtp-commit-exact", "GLM 5.3 MTP exact-sampling replacements reach the nextn slot they belong to", test_glm_mtp_commit_exact},
+    {"--glm-mtp-commit-fail", "glm-mtp-commit-fail", "GLM 5.3 MTP makes a slot whose nextn write failed unreadable instead of leaving it stale", test_glm_mtp_commit_fail},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
@@ -8792,6 +9840,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Pin the widest commit --glm-mtp-verify expects. Unset: DS4_GLM_MTP_DEPTH=2/3 expects that width, automatic depth only expects 2..3.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_TOKENS=N  Tokens to generate per request in --glm-mtp-window. Default: 64.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_CTX=N     Session context for --glm-mtp-window. Default: 4096.");
+    puts("  DS4_GLM_MTP_LEGACY=1              Run the legacy GLM MTP cycle; --glm-mtp-commit-token covers it (its rewrites fill the nextn KV alone).");
+    puts("  DS4_GLM_MTP_DEPTH=3               Required for --glm-mtp-commit-fail to cover the chained draft row.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");
     puts("  DS4_TEST_VECTOR_FILE=FILE  Official fixture. Default: flash-0731/official.vec.");
     puts("  DS4_TEST_LOCAL_GOLDEN_FILE=FILE  Local fixture. Default: flash-0731/local-golden.vec.");
