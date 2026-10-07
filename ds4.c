@@ -45197,7 +45197,8 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_rows_logits_gpu; /* [3][vocab] */
     ds4_gpu_tensor *mtp_embed_rows;      /* [3][embd] */
     ds4_gpu_tensor *mtp_hc_rows;         /* [3][hc][embd] */
-    ds4_gpu_tensor *mtp_chain_hidden;    /* [embd] nextn output of the last MTP row */
+    ds4_gpu_tensor *mtp_chain_hidden;    /* [embd] last MTP row after the head norm */
+    ds4_gpu_tensor *mtp_hc_postnorm;     /* [embd] trunk output_norm of one mHC row */
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -47042,6 +47043,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_embed_rows);
     ds4_gpu_tensor_free(g->mtp_hc_rows);
     ds4_gpu_tensor_free(g->mtp_chain_hidden);
+    ds4_gpu_tensor_free(g->mtp_hc_postnorm);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
@@ -47056,6 +47058,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     g->mtp_embed_rows = NULL;
     g->mtp_hc_rows = NULL;
     g->mtp_chain_hidden = NULL;
+    g->mtp_hc_postnorm = NULL;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -51517,6 +51520,7 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         g->mtp_embed_rows = ds4_gpu_tensor_alloc(3ull * DS4_N_EMBD * sizeof(float));
         g->mtp_hc_rows = ds4_gpu_tensor_alloc(3ull * DS4_N_HC * DS4_N_EMBD * sizeof(float));
         g->mtp_chain_hidden = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_hc_postnorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -51524,7 +51528,8 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         (g->glm53 && (!g->mtp_state_backup || !g->mtp_state_row[0] ||
                       !g->mtp_rows_hidden || !g->mtp_rows_norm ||
                       !g->mtp_rows_logits_gpu || !g->mtp_embed_rows ||
-                      !g->mtp_hc_rows || !g->mtp_chain_hidden)) ||
+                      !g->mtp_hc_rows || !g->mtp_chain_hidden ||
+                      !g->mtp_hc_postnorm)) ||
         !g->mtp_logits_host) {
         fprintf(stderr,
                 "ds4: glm mtp: allocation failed kv=%s rope=%s concat=%s "
@@ -51548,6 +51553,7 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->mtp_embed_rows);
         ds4_gpu_tensor_free(g->mtp_hc_rows);
         ds4_gpu_tensor_free(g->mtp_chain_hidden);
+        ds4_gpu_tensor_free(g->mtp_hc_postnorm);
         free(g->mtp_logits_host);
         g->mtp_kv_lora_cache = NULL;
         g->mtp_k_rope_cache = NULL;
@@ -51562,6 +51568,7 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         g->mtp_embed_rows = NULL;
         g->mtp_hc_rows = NULL;
         g->mtp_chain_hidden = NULL;
+        g->mtp_hc_postnorm = NULL;
         g->mtp_logits_host = NULL;
         return false;
     }
@@ -51633,7 +51640,10 @@ static bool glm_graph_mtp_matmul(
 /* Encode one nextn block row into the open command batch: input
  * concat(enorm(embed_row), hnorm(hidden)) at absolute position pos, attention
  * over MTP cache slots g->mtp_selected[0..n_selected), output in g->next.
- * hidden_hc: hidden is an mHC row and is reduced with hc_mean_weights first.
+ * hidden_hc: hidden is an mHC row.  It is reduced with hc_mean_weights and
+ *   then put through the trunk's output_norm, so the nextn block is conditioned
+ *   on the same post-norm hidden the trunk head turns into logits (vLLM
+ *   glm5next feeds MTP the value after the final model norm).
  * Callers write g->mtp_selected and every input row before encoding. */
 static bool glm_graph_mtp_encode_row(
         ds4_glm_gpu_graph    *g,
@@ -51659,7 +51669,8 @@ static bool glm_graph_mtp_encode_row(
         ds4_gpu_tensor_view(g->mtp_concat,
                             (uint64_t)DS4_N_EMBD * sizeof(float),
                             (uint64_t)DS4_N_EMBD * sizeof(float));
-    if (!enorm_view || !hnorm_view) {
+    if (!enorm_view || !hnorm_view ||
+        (hidden_hc && (!g->mtp_hc_postnorm || !weights->output_norm))) {
         ds4_gpu_tensor_free(enorm_view);
         ds4_gpu_tensor_free(hnorm_view);
         return false;
@@ -51673,16 +51684,30 @@ static bool glm_graph_mtp_encode_row(
                                                 l->nextn_enorm->abs_offset,
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
-    DS4_GLM_MTP_STAGE("hnorm");
     const ds4_gpu_tensor *target_hidden = hidden;
     if (ok && hidden_hc) {
+        /* vLLM's glm5next hands the nextn block the trunk hidden taken *after*
+         * the final model norm: hc_contract (the mean over the mHC streams)
+         * through self.norm.  Recompute it from this row here rather than
+         * borrow g->output_norm, which the nextn head norm overwrites on every
+         * draft and which no caller guarantees to be current. */
+        DS4_GLM_MTP_STAGE("hc_mean");
         ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
                                             hidden,
                                             g->hc_mean_weights,
                                             DS4_N_EMBD,
                                             DS4_N_HC) != 0;
-        target_hidden = g->hc_output;
+        DS4_GLM_MTP_STAGE("out_norm");
+        if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_hc_postnorm,
+                                                    g->hc_output,
+                                                    model->map,
+                                                    model->size,
+                                                    weights->output_norm->abs_offset,
+                                                    DS4_N_EMBD,
+                                                    DS4_RMS_EPS) != 0;
+        target_hidden = g->mtp_hc_postnorm;
     }
+    DS4_GLM_MTP_STAGE("hnorm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(hnorm_view,
                                                 target_hidden,
                                                 model->map,
@@ -51944,7 +51969,8 @@ static bool glm_graph_mtp_encode_row(
 
 
 /* One MTP step at (absolute) position pos: consumes the main model's last
- * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
+ * hidden h[pos] (g->cur for GLM-5.2; for GLM-5.3 the mHC row g->hc_cur, which
+ * encode_row reduces and puts through output_norm) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
  * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
 static bool glm_graph_mtp_step(
@@ -52032,12 +52058,11 @@ static bool glm_graph_mtp_step(
                                           pos,
                                           n_selected,
                                           &mtp_stage);
-    if (ok && g->mtp_chain_hidden) {
-        ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0,
-                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-    }
 
-    /* Shared output head behind the nextn head norm. */
+    /* Shared output head behind the nextn head norm.  GLM-5.3 recycles the
+     * post-head-norm value as the hidden of the next chained draft row, the
+     * same tensor the draft logits come from (vLLM mtp.py returns
+     * hidden_states twice). */
     DS4_GLM_MTP_STAGE("head_norm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                 g->next,
@@ -52046,6 +52071,10 @@ static bool glm_graph_mtp_step(
                                                 l->nextn_shared_head_norm->abs_offset,
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
+    if (ok && g->mtp_chain_hidden) {
+        ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->output_norm, 0,
+                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
     DS4_GLM_MTP_STAGE("head");
     if (ok) ok = glm_graph_mtp_matmul(g,
                                       g->logits,
@@ -52082,9 +52111,10 @@ static bool glm_graph_mtp_step(
 }
 
 /* GLM-5.3 nextn catch-up over n rows (1..3) in one command batch, like
- * qwen4_graph_mtp_steps: row t consumes the trunk mHC row hc_rows[t] and
- * next_tokens[t] at position pos + t and writes MTP cache slot pos + t.  Only
- * the last row runs the output head; its argmax is the next draft. */
+ * qwen4_graph_mtp_steps: row t consumes the trunk mHC row hc_rows[t] (reduced
+ * and put through output_norm by encode_row) and next_tokens[t] at position
+ * pos + t and writes MTP cache slot pos + t.  Only the last row runs the
+ * output head; its argmax is the next draft. */
 static bool glm53_graph_mtp_rows(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52158,7 +52188,6 @@ static bool glm53_graph_mtp_rows(
         ds4_gpu_tensor_free(h_row);
         ds4_gpu_tensor_free(e_row);
     }
-    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0, emb_bytes) != 0;
     if (ok) mtp_stage = "head";
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                 g->next,
@@ -52167,6 +52196,10 @@ static bool glm53_graph_mtp_rows(
                                                 l->nextn_shared_head_norm->abs_offset,
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
+    /* Recycle the post-head-norm hidden (what the draft logits read) into the
+     * next chained draft row. */
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->output_norm, 0,
+                                     emb_bytes) != 0;
     if (ok) ok = glm_graph_mtp_matmul(g, g->logits, model, weights->output,
                                       DS4_N_EMBD, DS4_N_VOCAB, g->output_norm);
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -52191,9 +52224,11 @@ static bool glm53_graph_mtp_rows(
 }
 
 /* Chained draft, like qwen4_graph_mtp_chain_step: one more nextn row at pos
- * conditioned on the nextn block's own last output (g->mtp_chain_hidden)
- * instead of a trunk row.  Writes MTP cache slot pos speculatively; the next
- * catch-up overwrites it with the true trunk row. */
+ * conditioned on the nextn block's own last output taken *after* its head norm
+ * (g->mtp_chain_hidden, the same value the previous draft logits came from)
+ * instead of a trunk row; this row's hnorm normalises it a second time, like
+ * vLLM.  Writes MTP cache slot pos speculatively; the next catch-up overwrites
+ * it with the true trunk row. */
 static bool glm53_graph_mtp_chain(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52226,10 +52261,6 @@ static bool glm53_graph_mtp_chain(
     if (ok) ok = glm_graph_mtp_encode_row(g, model, weights, g->next,
                                          g->mtp_chain_hidden, false,
                                          pos, n_selected, &mtp_stage);
-    if (ok && g->mtp_chain_hidden) {
-        ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->next, 0,
-                                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
-    }
     if (ok) mtp_stage = "head";
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                 g->next,
@@ -52238,6 +52269,10 @@ static bool glm53_graph_mtp_chain(
                                                 l->nextn_shared_head_norm->abs_offset,
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
+    /* Recycle the post-head-norm hidden (what the draft logits read) into the
+     * next chained draft row. */
+    if (ok) ok = ds4_gpu_tensor_copy(g->mtp_chain_hidden, 0, g->output_norm, 0,
+                                     (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     if (ok) ok = glm_graph_mtp_matmul(g, g->logits, model, weights->output,
                                       DS4_N_EMBD, DS4_N_VOCAB, g->output_norm);
     if (ok) ok = ds4_gpu_end_commands() != 0;
