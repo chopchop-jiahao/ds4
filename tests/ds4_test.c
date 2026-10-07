@@ -7650,8 +7650,19 @@ static void test_glm_mtp_verify(void) {
     }
     uint32_t max_gen = test_env_u32("DS4_TEST_GLM_MTP_TOKENS");
     if (max_gen == 0) max_gen = TEST_MTP_MAXGEN;
+    /* Widest commit this run may produce.  DS4_TEST_GLM_MTP_MAX_CHUNK pins it;
+     * otherwise a fixed DS4_GLM_MTP_DEPTH (=2 or =3) pins it to the depth; with
+     * neither, glm53_spec_depth() picks 2 or 3 at runtime and only the range is
+     * known. */
     uint32_t want_chunk = test_env_u32("DS4_TEST_GLM_MTP_MAX_CHUNK");
-    if (want_chunk == 0) want_chunk = 2;
+    bool chunk_fixed = want_chunk != 0;
+    if (!chunk_fixed) {
+        const uint32_t depth = test_env_u32("DS4_GLM_MTP_DEPTH");
+        if (depth == 2 || depth == 3) {
+            want_chunk = depth;
+            chunk_fixed = true;
+        }
+    }
 
     ds4_tokens prompt = {0};
     ds4_chat_begin(engine, &prompt);
@@ -7668,10 +7679,17 @@ static void test_glm_mtp_verify(void) {
                                                           spec, &nspec, &max_chunk, &single,
                                                           &dbl);
         TEST_ASSERT(ok_spec);
-        TEST_ASSERT(max_chunk == (int)want_chunk);  /* the widest commit the fixed depth allows ran */
+        if (chunk_fixed) {
+            TEST_ASSERT(max_chunk == (int)want_chunk);  /* the widest commit the fixed depth allows ran */
+        } else {
+            /* Automatic depth: glm53_spec_depth() only ever returns 2 or 3. */
+            TEST_ASSERT(max_chunk >= 2 && max_chunk <= 3);
+        }
         TEST_ASSERT(single > 0);      /* drafts were rejected: the recovery path ran */
         TEST_ASSERT(nspec >= 64);
-        if (want_chunk == 3) TEST_ASSERT(dbl > 0);  /* first draft accepted, second rejected */
+        if (chunk_fixed && want_chunk == 3) {
+            TEST_ASSERT(dbl > 0);     /* first draft accepted, second rejected */
+        }
 
         const char *dump = getenv("DS4_TEST_GLM_MTP_DUMP");
         if (dump && dump[0]) {
@@ -8079,7 +8097,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_PROMPT=FILE   User prompt for --glm-mtp-verify.");
     puts("  DS4_TEST_GLM_MTP_TOKENS=N      Tokens to generate in --glm-mtp-verify. Default: 256.");
     puts("  DS4_TEST_GLM_MTP_DUMP=FILE     Write the committed token ids from --glm-mtp-verify.");
-    puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Widest commit --glm-mtp-verify expects (2, or 3 with DS4_GLM_MTP_DEPTH=3). Default: 2.");
+    puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Pin the widest commit --glm-mtp-verify expects. Unset: DS4_GLM_MTP_DEPTH=2/3 expects that width, automatic depth only expects 2..3.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_TOKENS=N  Tokens to generate per request in --glm-mtp-window. Default: 64.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_CTX=N     Session context for --glm-mtp-window. Default: 4096.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");

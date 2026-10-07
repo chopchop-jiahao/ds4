@@ -51423,8 +51423,11 @@ static uint64_t glm53_graph_spec_state_offset(const ds4_glm_gpu_graph *g,
     return offset;
 }
 
-/* Last trunk layer: the nextn layer owns an indexer tail too, but the trunk
- * verify never touches it, so row snapshots only cover the trunk. */
+/* Last trunk layer.  glm_graph_validate_layout() rejects layer_end >=
+ * normal_layers, so the graph slice stops at the last trunk layer and the
+ * nextn (MTP) layer at index normal_layers is never in it; the layer_indexer_*
+ * buffers are allocated only for layer_start..layer_end, so that layer owns no
+ * indexer tail and row snapshots only cover the trunk. */
 static uint32_t glm53_graph_trunk_last_layer(const ds4_glm_gpu_graph *g) {
     const uint32_t trunk = glm_graph_normal_layer_count();
     const uint32_t last = trunk ? trunk - 1u : 0u;
