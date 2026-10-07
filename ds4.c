@@ -61847,6 +61847,14 @@ struct ds4_session {
      * only rises again until a cold prefill rewrites every slot.  The draft
      * window starts at max(glm_mtp_min_pos, this). */
     uint32_t glm_mtp_read_floor;
+    /* Ticket 006: whether the GLM-5.3 nextn (MTP) KV and indexer caches are a
+     * complete picture of the checkpoint: every slot [0, checkpoint.len-1]
+     * was written by a production path (prefill fill, decode/seam write, seam
+     * rewrite) since the last cold prefill, and nothing has moved or rewrote
+     * the checkpoint since without maintaining the matching slot.  Only a
+     * session with this flag saves the payload's MTP section with data; see
+     * ds4_session_glm_mtp_section(). */
+    bool glm_mtp_cache_complete;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     float *glm53_verify_hc;          /* fast GLM-5.3 cycle: [3][hc][embd] verify rows */
@@ -62895,7 +62903,11 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
  * hole-free over [0..checkpoint.len-1] by writing that slot as soon as the
  * next token exists, so every path that moves or rewrites the checkpoint
  * without writing the matching nextn slot has to drop the seam: the saved
- * hidden would otherwise describe a position the checkpoint no longer has. */
+ * hidden would otherwise describe a position the checkpoint no longer has.
+ * The .kv payload is the exception -- it saves the seam hidden, the slot's
+ * token and its position together, and a restore puts all three back
+ * (ticket 006), so a payload read is the one place a seam survives without
+ * the session having produced the token itself. */
 static void ds4_session_glm_mtp_seam_invalidate(ds4_session *s) {
     if (!s) return;
     s->glm_graph.mtp_seam_valid = false;
@@ -62934,6 +62946,9 @@ static uint32_t ds4_session_glm_mtp_absorb_writes(ds4_session *s) {
     if (failed == DS4_GLM_MTP_NO_SLOT) return DS4_GLM_MTP_NO_SLOT;
     g->mtp_write_failed = DS4_GLM_MTP_NO_SLOT;
     if (failed + 1u > s->glm_mtp_read_floor) s->glm_mtp_read_floor = failed + 1u;
+    /* A slot that was never written is not a hole a snapshot may paper over
+     * (ticket 006). */
+    s->glm_mtp_cache_complete = false;
     if (g->mtp_seam_pos == failed) {
         g->mtp_seam_valid = false;
         g->mtp_seam_written = -1;
@@ -62964,14 +62979,300 @@ static int ds4_session_glm_mtp_note_token(ds4_session *s, int token) {
 }
 
 /* The seam is gone for good: whatever the last slot holds is no longer known,
- * so a draft must not read it. */
+ * so a draft must not read it.  The same paths move or rewrite the checkpoint
+ * without maintaining the matching nextn slot, so from now on the caches do not
+ * describe the whole prefix and a snapshot may not claim they do (ticket 006). */
 static void ds4_session_glm_mtp_seam_drop(ds4_session *s) {
     if (!s) return;
     ds4_session_glm_mtp_seam_invalidate(s);
+    s->glm_mtp_cache_complete = false;
     const uint32_t len = s->checkpoint.len > 0 ? (uint32_t)s->checkpoint.len : 0u;
     if (ds4_session_glm_mtp_tracked(s) && len > s->glm_mtp_read_floor) {
         s->glm_mtp_read_floor = len;
     }
+}
+
+/* The nextn caches stopped being a complete picture of the checkpoint without
+ * the seam going away with it: a slot write failed, a rewind moved the
+ * checkpoint back, or a payload without nextn data was read.  The only way back
+ * to complete is a cold prefill that fills every slot, or a payload read that
+ * restored every slot (ticket 006). */
+static void ds4_session_glm_mtp_note_incomplete(ds4_session *s) {
+    if (s) s->glm_mtp_cache_complete = false;
+}
+
+/* ---------------------------------------------------------------------
+ * GLM-5.3 nextn (MTP) payload section (ticket 006).
+ *
+ * The section trails the trunk layers of a GLM-5.3 .kv payload and describes
+ * itself the way the Qwen3.8 payload's leading mtp_rows count does: a reader
+ * never has to guess whether the writer had nextn caches.  Five uint32 fields
+ * are always there:
+ *   flags        bit 0: the caches follow; bit 1: the seam hidden is valid
+ *   rows         nextn KV and rope rows, == the trunk's live compact rows
+ *   pool_rows    pooled indexer key rows, == rows / DS4_GLM53_INDEX_POOL_SIZE
+ *   seam_pos     absolute position the seam describes
+ *   seam_written the token the checkpoint's last nextn slot holds, -1: none
+ * Then, only with the data flag set, the caches themselves: the nextn compact
+ * KV and rope rows and the pooled indexer rows in the trunk's external f32
+ * form, the raw K and gate tail windows, and the seam's post-norm hidden
+ * (already f32, stored unchanged).
+ * --------------------------------------------------------------------- */
+#define DS4_GLM_MTP_SECTION_FLAG_DATA 1u
+#define DS4_GLM_MTP_SECTION_FLAG_SEAM 2u
+#define DS4_GLM_MTP_SECTION_FLAG_ALL \
+    (DS4_GLM_MTP_SECTION_FLAG_DATA | DS4_GLM_MTP_SECTION_FLAG_SEAM)
+#define DS4_GLM_MTP_SECTION_U32_FIELDS 5u
+
+typedef struct {
+    uint32_t flags;
+    uint32_t rows;
+    uint32_t pool_rows;
+    uint32_t seam_pos;
+    int32_t  seam_written;
+} ds4_glm_mtp_section;
+
+/* The seam keeps one post-norm hidden row of f32 (glm_graph_mtp_ensure()). */
+static uint64_t glm53_mtp_seam_hidden_bytes(void) {
+    return (uint64_t)DS4_N_EMBD * sizeof(float);
+}
+
+/* The nextn live row count a snapshot may describe: the same live row count the
+ * trunk's compact cache uses, so a reader re-derives it from its own header
+ * fields.  0 when the two formulas disagree. */
+static uint32_t ds4_session_glm_mtp_live_rows(const ds4_session *s) {
+    if (!s || !s->glm_graph_ready) return 0;
+    const ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->glm53 || g->compact_cache_cap == 0) return 0;
+    const uint32_t checkpoint_len = (uint32_t)s->checkpoint.len;
+    const uint32_t cap = glm_graph_mtp_cache_cap(g);
+    const uint32_t rows = cap < checkpoint_len ? cap : checkpoint_len;
+    if (rows != session_glm_compact_live_rows(g, checkpoint_len)) return 0;
+    return rows;
+}
+
+/* Fill in the section a snapshot of this session would write.  Returns false
+ * (and a description with no data flag) when the nextn caches are not a
+ * complete, restorable picture of the checkpoint.  No side effects: the size
+ * and the write both call it and must agree byte for byte. */
+static bool ds4_session_glm_mtp_section(const ds4_session *s,
+                                        ds4_glm_mtp_section *out) {
+    memset(out, 0, sizeof(*out));
+    out->seam_written = -1;
+    if (!s || !s->glm_mtp_cache_complete ||
+        !ds4_session_glm_mtp_cache_enabled(s)) {
+        return false;
+    }
+    const ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->mtp_ready || !g->mtp_kv_lora_cache || !g->mtp_k_rope_cache ||
+        !g->mtp_indexer_key_cache || !g->mtp_indexer_tail_k ||
+        !g->mtp_indexer_tail_gate || !g->mtp_seam_hidden ||
+        ds4_gpu_tensor_bytes(g->mtp_seam_hidden) !=
+            glm53_mtp_seam_hidden_bytes() ||
+        ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) !=
+            session_glm53_indexer_tail_bytes()) {
+        return false;
+    }
+    out->flags = DS4_GLM_MTP_SECTION_FLAG_DATA;
+    out->rows = ds4_session_glm_mtp_live_rows(s);
+    out->pool_rows = out->rows / DS4_GLM53_INDEX_POOL_SIZE;
+    /* The seam's position and the token its slot holds are part of the state
+     * even when the hidden a rewrite needs is gone (ticket 005). */
+    out->seam_pos = g->mtp_seam_pos;
+    out->seam_written = g->mtp_seam_written;
+    if (g->mtp_seam_valid) out->flags |= DS4_GLM_MTP_SECTION_FLAG_SEAM;
+    return true;
+}
+
+static uint64_t ds4_glm_mtp_section_bytes(const ds4_glm_mtp_section *sec) {
+    uint64_t bytes = (uint64_t)DS4_GLM_MTP_SECTION_U32_FIELDS *
+                     sizeof(uint32_t);
+    if (!sec || (sec->flags & DS4_GLM_MTP_SECTION_FLAG_DATA) == 0) return bytes;
+    bytes += (uint64_t)sec->rows * DS4_N_KV_LORA * sizeof(float);
+    bytes += (uint64_t)sec->rows * DS4_N_ROT * sizeof(float);
+    bytes += (uint64_t)sec->pool_rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    /* One pooled tail window of raw keys, with the gate half behind it. */
+    bytes += session_glm53_indexer_tail_bytes();
+    bytes += glm53_mtp_seam_hidden_bytes();
+    return bytes;
+}
+
+static int ds4_session_save_glm_mtp_section(ds4_session *s, FILE *fp,
+                                            const ds4_glm_mtp_section *sec,
+                                            char *err, size_t errlen) {
+    if (payload_write_u32(fp, sec->flags, err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, sec->rows, err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, sec->pool_rows, err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, sec->seam_pos, err, errlen) != 0) return 1;
+    if (payload_write_u32(fp, (uint32_t)sec->seam_written, err, errlen) != 0) {
+        return 1;
+    }
+    if ((sec->flags & DS4_GLM_MTP_SECTION_FLAG_DATA) == 0) return 0;
+
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_write_glm_compact_span(
+        fp, g->mtp_kv_lora_cache,
+        (uint64_t)sec->rows * DS4_N_KV_LORA,
+        buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    if (rc == 0) {
+        rc = payload_write_glm_compact_span(
+            fp, g->mtp_k_rope_cache,
+            (uint64_t)sec->rows * DS4_N_ROT,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    if (rc == 0) {
+        rc = payload_write_glm_compact_span(
+            fp, g->mtp_indexer_key_cache,
+            (uint64_t)sec->pool_rows * DS4_N_INDEXER_HEAD_DIM,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    if (rc == 0) {
+        const uint64_t tail_bytes =
+            session_glm53_indexer_tail_bytes() / 2u;
+        rc = payload_write_tensor_span(fp, g->mtp_indexer_tail_k, 0,
+                                       tail_bytes, buf,
+                                       DS4_SESSION_IO_CHUNK, err, errlen);
+        if (rc == 0) {
+            rc = payload_write_tensor_span(fp, g->mtp_indexer_tail_gate, 0,
+                                           tail_bytes, buf,
+                                           DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    if (rc == 0) {
+        rc = payload_write_tensor_span(fp, g->mtp_seam_hidden, 0,
+                                       glm53_mtp_seam_hidden_bytes(), buf,
+                                       DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    free(buf);
+    return rc;
+}
+
+/* Read (or, for a session that does not maintain the nextn caches, drop) the
+ * trailing MTP section.  expected_rows is the trunk's live compact row count
+ * re-derived from the payload header, so a section describing anything else is
+ * a different checkpoint and is refused the way the trunk row counts are. */
+static int ds4_session_load_glm_mtp_section(ds4_session *s, FILE *fp,
+                                            uint64_t *remaining,
+                                            uint32_t expected_rows,
+                                            char *err, size_t errlen) {
+    ds4_glm_mtp_section sec;
+    memset(&sec, 0, sizeof(sec));
+    sec.seam_written = -1;
+    uint32_t fields[DS4_GLM_MTP_SECTION_U32_FIELDS];
+    for (uint32_t i = 0; i < DS4_GLM_MTP_SECTION_U32_FIELDS; i++) {
+        if (payload_read_u32(fp, &fields[i], remaining, err, errlen) != 0) {
+            return 1;
+        }
+    }
+    sec.flags = fields[0];
+    sec.rows = fields[1];
+    sec.pool_rows = fields[2];
+    sec.seam_pos = fields[3];
+    sec.seam_written = (int32_t)fields[4];
+    const bool has_data = (sec.flags & DS4_GLM_MTP_SECTION_FLAG_DATA) != 0;
+    if ((sec.flags & ~DS4_GLM_MTP_SECTION_FLAG_ALL) != 0) {
+        payload_set_err(err, errlen,
+                        "KV checkpoint GLM MTP section has unknown flags");
+        return 1;
+    }
+    if (!has_data) {
+        /* A writer without complete nextn caches cannot give a session that
+         * drafts from them anything to draft from: the caller treats this as a
+         * cache miss and prefills, which rebuilds the caches from 0. */
+        if (ds4_session_glm_mtp_cache_enabled(s)) {
+            payload_set_err(err, errlen,
+                            "KV checkpoint has no GLM MTP caches for this runtime");
+            return 1;
+        }
+        ds4_session_glm_mtp_seam_invalidate(s);
+        ds4_session_glm_mtp_note_incomplete(s);
+        return 0;
+    }
+    if (sec.rows != expected_rows ||
+        sec.pool_rows != sec.rows / DS4_GLM53_INDEX_POOL_SIZE) {
+        payload_set_err(err, errlen,
+                        "KV checkpoint GLM MTP row count does not match token count");
+        return 1;
+    }
+    const uint64_t data_bytes = ds4_glm_mtp_section_bytes(&sec) -
+        (uint64_t)DS4_GLM_MTP_SECTION_U32_FIELDS * sizeof(uint32_t);
+    if (!ds4_session_glm_mtp_cache_enabled(s)) {
+        /* MTP off, or a configuration the fast cycle does not run in: the
+         * caches are not allocated here, so the section is only skipped. */
+        uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+        const int rc = payload_skip_bytes(fp, data_bytes, buf,
+                                         DS4_SESSION_IO_CHUNK, remaining,
+                                         err, errlen);
+        free(buf);
+        if (rc == 0) {
+            ds4_session_glm_mtp_seam_invalidate(s);
+            ds4_session_glm_mtp_note_incomplete(s);
+        }
+        return rc;
+    }
+
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!glm_graph_mtp_ensure(g)) {
+        payload_set_err(err, errlen,
+                        "KV checkpoint GLM MTP cache could not be allocated");
+        return 1;
+    }
+    if (sec.rows > glm_graph_mtp_cache_cap(g) ||
+        ds4_gpu_tensor_bytes(g->mtp_seam_hidden) !=
+            glm53_mtp_seam_hidden_bytes() ||
+        ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) !=
+            session_glm53_indexer_tail_bytes()) {
+        payload_set_err(err, errlen,
+                        "KV checkpoint GLM MTP caches do not match this runtime");
+        return 1;
+    }
+    const uint64_t tail_bytes = session_glm53_indexer_tail_bytes() / 2u;
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_read_glm_compact_span(
+        fp, g->mtp_kv_lora_cache, (uint64_t)sec.rows * DS4_N_KV_LORA,
+        buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    if (rc == 0) {
+        rc = payload_read_glm_compact_span(
+            fp, g->mtp_k_rope_cache, (uint64_t)sec.rows * DS4_N_ROT,
+            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    }
+    if (rc == 0) {
+        rc = payload_read_glm_compact_span(
+            fp, g->mtp_indexer_key_cache,
+            (uint64_t)sec.pool_rows * DS4_N_INDEXER_HEAD_DIM,
+            buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    }
+    if (rc == 0) {
+        rc = payload_read_tensor_span(fp, g->mtp_indexer_tail_k, 0, tail_bytes,
+                                      buf, DS4_SESSION_IO_CHUNK, remaining,
+                                      err, errlen);
+    }
+    if (rc == 0) {
+        rc = payload_read_tensor_span(fp, g->mtp_indexer_tail_gate, 0,
+                                      tail_bytes, buf, DS4_SESSION_IO_CHUNK,
+                                      remaining, err, errlen);
+    }
+    if (rc == 0) {
+        rc = payload_read_tensor_span(fp, g->mtp_seam_hidden, 0,
+                                      glm53_mtp_seam_hidden_bytes(), buf,
+                                      DS4_SESSION_IO_CHUNK, remaining,
+                                      err, errlen);
+    }
+    free(buf);
+    if (rc != 0) {
+        ds4_session_glm_mtp_note_incomplete(s);
+        return 1;
+    }
+    /* The caches and the seam are the writer's, slot for slot and byte for
+     * byte, so the seam keeps exactly the state it had: invalid stays invalid
+     * and a pending seam rewrite still fills its slot (ticket 006). */
+    glm53_graph_mtp_clear_requests(g);
+    g->mtp_seam_pos = sec.seam_pos;
+    g->mtp_seam_written = sec.seam_written;
+    g->mtp_seam_valid = (sec.flags & DS4_GLM_MTP_SECTION_FLAG_SEAM) != 0;
+    s->glm_mtp_cache_complete = true;
+    return 0;
 }
 
 /* Drop left-over nextn cache requests after a forward call.  A seam rewrite no
@@ -64352,6 +64653,14 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
         bytes += (uint64_t)g->normal_layers * sizeof(uint32_t);
         bytes += (uint64_t)g->normal_layers * sizeof(uint32_t);
         bytes += session_glm_payload_live_tensor_bytes(g, full_live, compact_live);
+        /* GLM-5.3 only: the trailing nextn (MTP) section (ticket 006).  GLM
+         * 5.2 has no nextn caches and its payload is byte for byte what it
+         * was before. */
+        if (g->glm53) {
+            ds4_glm_mtp_section mtp;
+            (void)ds4_session_glm_mtp_section(s, &mtp);
+            bytes += ds4_glm_mtp_section_bytes(&mtp);
+        }
         return bytes;
 #endif
     }
@@ -64833,6 +65142,15 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
             }
         }
         free(buf);
+        /* GLM-5.3 only: the trailing nextn (MTP) section.  It carries the
+         * nextn caches and the seam whenever this session maintains them over
+         * the whole checkpoint, and only its own description otherwise
+         * (ticket 006).  GLM 5.2 writes no section at all. */
+        if (rc == 0 && g->glm53) {
+            ds4_glm_mtp_section mtp;
+            (void)ds4_session_glm_mtp_section(s, &mtp);
+            rc = ds4_session_save_glm_mtp_section(s, fp, &mtp, err, errlen);
+        }
         return rc;
 #endif
     }
@@ -65291,6 +65609,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             token_vec_free(&new_checkpoint);
             return 1;
         }
+        /* GLM-5.3 only: the trailing nextn (MTP) section (ticket 006).  It is
+         * read while the checkpoint is still the caller's old one and
+         * checkpoint_valid is false, so a section this runtime cannot take
+         * ends the whole load as a miss instead of leaving a half-restored
+         * trunk behind. */
+        if (g->glm53) {
+            if (ds4_session_load_glm_mtp_section(s, fp, &remaining,
+                                                expected_compact_live,
+                                                err, errlen) != 0) {
+                token_vec_free(&new_checkpoint);
+                return 1;
+            }
+        }
         if (remaining != 0) {
             token_vec_free(&new_checkpoint);
             payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
@@ -65307,11 +65638,26 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
-        /* The .kv payload has no seam hidden field yet, so a restored session
-         * has no seam: the one position that waited for its next token stays
-         * unwritten until the payload grows that field, and nothing above it
-         * is readable for a draft either (ticket 005). */
-        ds4_session_glm_mtp_seam_drop(s);
+        /* Ticket 006: the .kv payload carries the nextn caches and the seam.
+         * A section with data restored both, so the seam is exactly what the
+         * writer had -- including a slot still waiting for its real next
+         * token, which the restored session rewrites from the restored
+         * hidden.  A session that could not take the section has no seam and
+         * no readable last slot, which ds4_session_load_glm_mtp_section()
+         * arranged.
+         *
+         * What stays as ticket 005 left it is the read floor: which slots a
+         * draft may read is a question this ticket does not touch, so a
+         * restored session still starts reading above the restored prefix --
+         * the same floor ds4_session_glm_mtp_seam_drop() used to leave behind.
+         * The caches being complete is what lets a later ticket lower it. */
+        if (g->glm53) {
+            const uint32_t restored_len = (uint32_t)s->checkpoint.len;
+            if (ds4_session_glm_mtp_tracked(s) &&
+                restored_len > s->glm_mtp_read_floor) {
+                s->glm_mtp_read_floor = restored_len;
+            }
+        }
         return 0;
 #endif
     }
@@ -76251,6 +76597,10 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     ds4_glm_gpu_graph *g = &s->glm_graph;
     /* A rewind is not a place to spend a queued nextn write on. */
     glm53_graph_mtp_clear_requests(g);
+    /* Every rewind drops the tail it truncates, and the slots before it may
+     * carry the tokens the rewind gives up on: a snapshot may no longer claim
+     * the caches describe the kept prefix (ticket 006). */
+    s->glm_mtp_cache_complete = false;
     if (s->glm_mtp_rollback_fast) {
         /* Row snapshots hold the state after row 0 / row 1 of the verify. */
         const uint32_t keep = (uint32_t)pos - start;
@@ -78057,6 +78407,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 prompt->len);
                 }
             }
+            /* Ticket 006: a cold prefill with the fill on wrote a nextn slot
+             * for every position of the new checkpoint, so from here the
+             * caches describe it completely and a snapshot may carry them.
+             * A failed slot write raises the read floor above 0 and has
+             * already cleared the flag; a resumed sync keeps whatever the
+             * session had, since it only appended densely-written rows. */
+            if (glm53_mtp_fill) {
+                if (start == 0 && s->glm_mtp_read_floor == 0) {
+                    s->glm_mtp_cache_complete = true;
+                }
+            } else {
+                ds4_session_glm_mtp_note_incomplete(s);
+            }
             glm_debug_dump_prefill_logits(s->logits);
             return 0;
         }
@@ -79787,8 +80150,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             } else {
                 /* Plain decode appends a token without writing any nextn cache
                  * slot, so the seam's position is no longer the checkpoint's
-                 * last position (ticket 004). */
+                 * last position (ticket 004), and the slot it stepped over
+                 * stays unwritten (ticket 006). */
                 ds4_session_glm_mtp_seam_invalidate(s);
+                ds4_session_glm_mtp_note_incomplete(s);
             }
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
@@ -82002,8 +82367,12 @@ static int ds4_sessions_eval_batch_native(
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         /* The batched decode row writes no nextn cache slot, so the seam no
-         * longer describes the checkpoint's last position (ticket 004). */
-        if (ds4_session_is_glm(s)) ds4_session_glm_mtp_seam_invalidate(s);
+         * longer describes the checkpoint's last position (ticket 004) and the
+         * slot it stepped over stays unwritten (ticket 006). */
+        if (ds4_session_is_glm(s)) {
+            ds4_session_glm_mtp_seam_invalidate(s);
+            ds4_session_glm_mtp_note_incomplete(s);
+        }
         if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
         if (!ds4_session_is_glm(s) && !native_ds41) {
             ds4_session_dspark_capture_note_checkpoint(s);
@@ -82280,8 +82649,12 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
         token_vec_push(&s->checkpoint, items[i].token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
-        /* Mixed batch decode writes no nextn cache slot: drop the seam. */
-        if (ds4_session_is_glm(s)) ds4_session_glm_mtp_seam_invalidate(s);
+        /* Mixed batch decode writes no nextn cache slot: drop the seam, and
+         * with it any claim that the caches cover the checkpoint (006). */
+        if (ds4_session_is_glm(s)) {
+            ds4_session_glm_mtp_seam_invalidate(s);
+            ds4_session_glm_mtp_note_incomplete(s);
+        }
         ds4_session_dspark_capture_note_checkpoint(s);
     }
     if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
@@ -87590,8 +87963,10 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
-    /* A dropped checkpoint has no last position for the seam to describe. */
+    /* A dropped checkpoint has no last position for the seam to describe, and
+     * the nextn caches no longer stand for anything (ticket 006). */
     ds4_session_glm_mtp_seam_invalidate(s);
+    ds4_session_glm_mtp_note_incomplete(s);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
@@ -87925,6 +88300,25 @@ int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
     return 1;
 }
 
+/* Ticket 006 test hooks: the seam's kept hidden row and the completeness flag
+ * a payload's MTP section is saved under. */
+int ds4_test_glm_mtp_seam_hidden(ds4_session *s, float *hidden,
+                                 uint32_t hidden_cap, uint32_t *embd_values) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !g->mtp_seam_hidden) return 0;
+    const uint64_t values =
+        ds4_gpu_tensor_bytes(g->mtp_seam_hidden) / sizeof(float);
+    if (embd_values) *embd_values = (uint32_t)values;
+    if (!hidden) return 1;
+    if (values == 0 || hidden_cap < (uint32_t)values) return 0;
+    return ds4_gpu_tensor_read(g->mtp_seam_hidden, 0, hidden,
+                               values * sizeof(float)) != 0;
+}
+
+int ds4_test_glm_mtp_cache_complete(ds4_session *s) {
+    return s && s->glm_mtp_cache_complete ? 1 : 0;
+}
+
 int ds4_test_glm_mtp_dense(ds4_session *s) {
 #ifndef DS4_NO_GPU
     return ds4_session_glm_mtp_cache_enabled(s) ? 1 : 0;
@@ -87992,6 +88386,15 @@ uint32_t ds4_test_glm_mtp_read_floor(ds4_session *s) {
 int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
                                 int *hidden_kept) {
     (void)s; (void)pos; (void)written; (void)hidden_kept;
+    return 0;
+}
+int ds4_test_glm_mtp_seam_hidden(ds4_session *s, float *hidden,
+                                 uint32_t hidden_cap, uint32_t *embd_values) {
+    (void)s; (void)hidden; (void)hidden_cap; (void)embd_values;
+    return 0;
+}
+int ds4_test_glm_mtp_cache_complete(ds4_session *s) {
+    (void)s;
     return 0;
 }
 int ds4_test_glm_mtp_dense(ds4_session *s) {

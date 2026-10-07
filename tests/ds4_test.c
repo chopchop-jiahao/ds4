@@ -504,6 +504,280 @@ cleanup:
     test_restore_env("DS4_QWEN4_SPEC_FORCE_ACCEPT", saved_force);
 }
 
+/* ---- ticket 006: the GLM-5.3 nextn (MTP) state a snapshot must carry ---- */
+
+/* Speculative cycles the ticket-006 tests run: the snapshot save points and the
+ * cross-mode payload test both use this many. */
+#define TEST_GLM_MTP_PAYLOAD_CYCLES 16
+
+typedef struct {
+    uint32_t len;          /* checkpoint length the state covers */
+    uint32_t kv_dim;
+    uint32_t pool_dim;
+    uint32_t pool_size;
+    uint32_t tail_dim;
+    uint32_t embd;
+    float   *kv;           /* [len][kv_dim] */
+    float   *pool;         /* [len][pool_dim]: the pooled row covering each slot */
+    float   *tail;         /* raw K window, then the gate window */
+    float   *seam;         /* [embd] kept post-norm hidden */
+    uint32_t seam_pos;
+    int      seam_written;
+    int      seam_kept;
+    int      complete;
+} test_mtp_state;
+
+static bool test_mtp_row_zero(const float *v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (v[i] != 0.0f) return false;
+    }
+    return true;
+}
+
+static bool test_mtp_row_written(const float *v, uint32_t n) {
+    bool any = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!isfinite(v[i])) return false;
+        if (v[i] != 0.0f) any = true;
+    }
+    return any;
+}
+
+static float test_mtp_row_max_abs(const float *a, const float *b, uint32_t n) {
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const float d = fabsf(a[i] - b[i]);
+        if (d > max_abs) max_abs = d;
+    }
+    return max_abs;
+}
+
+static void test_mtp_state_free(test_mtp_state *st) {
+    if (!st) return;
+    free(st->kv);
+    free(st->pool);
+    free(st->tail);
+    free(st->seam);
+    memset(st, 0, sizeof(*st));
+}
+
+/* Read every nextn state a payload section is supposed to carry back through
+ * the ds4-test probes only: one KV row and the pooled row covering it per slot,
+ * the whole raw tail window, the seam (position, token, validity and hidden)
+ * and the completeness flag. */
+static bool test_mtp_state_capture(ds4_session *s, test_mtp_state *out) {
+    memset(out, 0, sizeof(*out));
+    uint32_t cache_cap = 0;
+    if (!ds4_test_glm_mtp_cache_dims(s, &out->kv_dim, &out->pool_dim,
+                                     &out->pool_size, &out->tail_dim,
+                                     &cache_cap) ||
+        !ds4_test_glm_mtp_seam_hidden(s, NULL, 0, &out->embd)) {
+        return false;
+    }
+    const int pos = s ? ds4_session_pos(s) : 0;
+    out->len = pos > 0 ? (uint32_t)pos : 0u;
+    if (out->len > cache_cap || out->kv_dim == 0 || out->pool_dim == 0 ||
+        out->tail_dim == 0 || out->embd == 0) {
+        test_mtp_state_free(out);
+        return false;
+    }
+    const size_t rows = out->len;
+    out->kv = malloc(rows * out->kv_dim * sizeof(float) + sizeof(float));
+    out->pool = malloc(rows * out->pool_dim * sizeof(float) + sizeof(float));
+    out->tail = malloc((size_t)out->tail_dim * sizeof(float));
+    out->seam = malloc((size_t)out->embd * sizeof(float));
+    if (!out->kv || !out->pool || !out->tail || !out->seam) {
+        test_mtp_state_free(out);
+        return false;
+    }
+    for (uint32_t p = 0; p < out->len; p++) {
+        if (!ds4_test_glm_read_mtp_kv(s, p,
+                                      out->kv + (uint64_t)p * out->kv_dim,
+                                      out->kv_dim,
+                                      out->pool + (uint64_t)p * out->pool_dim,
+                                      out->pool_dim, NULL, 0)) {
+            test_mtp_state_free(out);
+            return false;
+        }
+    }
+    if (!ds4_test_glm_read_mtp_kv(s, 0, NULL, 0, NULL, 0, out->tail,
+                                  out->tail_dim) ||
+        !ds4_test_glm_mtp_seam_state(s, &out->seam_pos, &out->seam_written,
+                                     &out->seam_kept) ||
+        !ds4_test_glm_mtp_seam_hidden(s, out->seam, out->embd, NULL)) {
+        test_mtp_state_free(out);
+        return false;
+    }
+    out->complete = ds4_test_glm_mtp_cache_complete(s);
+    return true;
+}
+
+/* Byte for byte, exactly what the payload section promised to carry. */
+static bool test_mtp_state_equal(const test_mtp_state *a,
+                                 const test_mtp_state *b, const char *tag) {
+    bool ok = true;
+    if (a->len != b->len) {
+        fprintf(stderr, "ds4-test: mtp %s state length %u/%u\n", tag, a->len,
+                b->len);
+        return false;
+    }
+    if (a->complete != b->complete || a->seam_pos != b->seam_pos ||
+        a->seam_written != b->seam_written ||
+        a->seam_kept != b->seam_kept) {
+        fprintf(stderr,
+                "ds4-test: mtp %s state differs complete=%d/%d "
+                "seam=%u/%u written=%d/%d kept=%d/%d\n", tag,
+                a->complete, b->complete, a->seam_pos, b->seam_pos,
+                a->seam_written, b->seam_written, a->seam_kept, b->seam_kept);
+        ok = false;
+    }
+    const size_t kv_n = (size_t)a->len * a->kv_dim;
+    if (memcmp(a->kv, b->kv, kv_n * sizeof(float)) != 0) {
+        size_t first = 0;
+        while (first < kv_n &&
+               memcmp(&a->kv[first], &b->kv[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr, "ds4-test: mtp %s KV differs at float %zu of %zu\n",
+                tag, first, kv_n);
+        ok = false;
+    }
+    const size_t pool_n = (size_t)a->len * a->pool_dim;
+    if (memcmp(a->pool, b->pool, pool_n * sizeof(float)) != 0) {
+        size_t first = 0;
+        while (first < pool_n &&
+               memcmp(&a->pool[first], &b->pool[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr, "ds4-test: mtp %s pool differs at float %zu of %zu\n",
+                tag, first, pool_n);
+        ok = false;
+    }
+    if (a->tail_dim != b->tail_dim ||
+        memcmp(a->tail, b->tail, (size_t)a->tail_dim * sizeof(float)) != 0) {
+        fprintf(stderr, "ds4-test: mtp %s tail differs\n", tag);
+        ok = false;
+    }
+    if (a->embd != b->embd ||
+        memcmp(a->seam, b->seam, (size_t)a->embd * sizeof(float)) != 0) {
+        fprintf(stderr, "ds4-test: mtp %s seam hidden differs\n", tag);
+        ok = false;
+    }
+    return ok;
+}
+
+/* Byte for byte, exactly what the payload section promised to carry. */
+static bool test_mtp_state_prefix_equal(const test_mtp_state *a,
+                                        const test_mtp_state *b,
+                                        uint32_t rows, const char *tag) {
+    bool ok = true;
+    if (a->kv_dim != b->kv_dim || a->pool_dim != b->pool_dim ||
+        a->tail_dim != b->tail_dim) {
+        fprintf(stderr, "ds4-test: mtp %s cache shape differs\n", tag);
+        return false;
+    }
+    if (rows > a->len || rows > b->len) {
+        fprintf(stderr, "ds4-test: mtp %s prefix %u of %u/%u\n", tag, rows,
+                a->len, b->len);
+        return false;
+    }
+    const size_t kv_n = (size_t)rows * a->kv_dim;
+    if (memcmp(a->kv, b->kv, kv_n * sizeof(float)) != 0) {
+        size_t first = 0;
+        while (first < kv_n &&
+               memcmp(&a->kv[first], &b->kv[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr, "ds4-test: mtp %s KV differs in the first %u slots at "
+                        "float %zu of %zu\n", tag, rows, first, kv_n);
+        ok = false;
+    }
+    const size_t pool_n = (size_t)rows * a->pool_dim;
+    if (memcmp(a->pool, b->pool, pool_n * sizeof(float)) != 0) {
+        size_t first = 0;
+        while (first < pool_n &&
+               memcmp(&a->pool[first], &b->pool[first], sizeof(float)) == 0) {
+            first++;
+        }
+        fprintf(stderr, "ds4-test: mtp %s pool differs in the first %u slots at "
+                        "float %zu of %zu\n", tag, rows, first, pool_n);
+        ok = false;
+    }
+    if (memcmp(a->tail, b->tail, (size_t)a->tail_dim * sizeof(float)) != 0) {
+        fprintf(stderr, "ds4-test: mtp %s tail differs\n", tag);
+        ok = false;
+    }
+    return ok;
+}
+
+static double test_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+/* Save a live session's payload and restore it into a fresh session whose
+ * nextn caches were zeroed first, then compare the two byte for byte. */
+static bool test_mtp_snapshot_point(ds4_session *live, ds4_engine *engine,
+                                    uint32_t ctx, const char *tag) {
+    char err[192] = {0};
+    test_mtp_state ref = {0};
+    test_mtp_state got = {0};
+    ds4_session *scratch = NULL;
+    FILE *fp = NULL;
+    bool ok = test_mtp_state_capture(live, &ref);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: mtp %s could not read the live caches\n", tag);
+        return false;
+    }
+    const uint64_t expected = ds4_session_payload_bytes(live);
+    fp = tmpfile();
+    ok = fp != NULL;
+    if (ok) {
+        const double t0 = test_now_ms();
+        const int rc = ds4_session_save_payload(live, fp, err, sizeof(err));
+        const double save_ms = test_now_ms() - t0;
+        const long written = ftello(fp);
+        ok = rc == 0 && expected != 0 && (uint64_t)written == expected;
+        fprintf(stderr, "ds4-test: mtp snapshot %s len=%u mod=%u payload=%" PRIu64
+                        " save=%.1fms complete=%d\n", tag, ref.len,
+                        ref.len % ref.pool_size, (uint64_t)written, save_ms,
+                        ref.complete);
+        if (!ok) {
+            fprintf(stderr, "ds4-test: mtp %s save failed: %s "
+                            "bytes=%ld expected=%" PRIu64 "\n", tag, err,
+                    written, expected);
+        }
+        fflush(fp);
+        rewind(fp);
+        if (ok) {
+            ok = ds4_session_create(&scratch, engine, ctx) == 0 && scratch != NULL;
+        }
+        if (ok) {
+            /* The nextn caches are allocated lazily, so zeroing them here is
+             * what puts zeros in place for the restore to overwrite. */
+            ds4_test_glm_zero_mtp_caches(scratch);
+            const double t1 = test_now_ms();
+            const int lrc = ds4_session_load_payload(scratch, fp,
+                                                     (uint64_t)written,
+                                                     err, sizeof(err));
+            const double load_ms = test_now_ms() - t1;
+            fprintf(stderr, "ds4-test: mtp snapshot %s load=%.1fms\n", tag,
+                    load_ms);
+            ok = lrc == 0 &&
+                 ds4_session_pos(scratch) == ds4_session_pos(live);
+            if (!ok) fprintf(stderr, "ds4-test: mtp %s load failed: %s\n", tag, err);
+        }
+        if (ok) ok = test_mtp_state_capture(scratch, &got);
+        if (ok) ok = test_mtp_state_equal(&ref, &got, tag);
+    }
+    test_mtp_state_free(&got);
+    test_mtp_state_free(&ref);
+    ds4_session_free(scratch);
+    if (fp) fclose(fp);
+    return ok;
+}
+
 static void test_session_snapshot_roundtrip(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine) return;
@@ -517,11 +791,29 @@ static void test_session_snapshot_roundtrip(void) {
     ds4_token_score reference_after[8];
     ds4_token_score restored_before[8];
     ds4_token_score restored_after[8];
-    enum { GLM_MTP_SNAPSHOT_CYCLES = 16 };
+    enum { GLM_MTP_SNAPSHOT_CYCLES = TEST_GLM_MTP_PAYLOAD_CYCLES };
     int reference_accepted[GLM_MTP_SNAPSHOT_CYCLES * 2] = {0};
     int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
+    /* Ticket 006 adds the nextn (MTP) checks only on GLM 5.3 with the MTP
+     * engine on; every other model keeps this test exactly as it was. */
+    const bool glm53_mtp = test_glm_mtp && ds4_engine_is_glm53(engine);
+    uint32_t mtp_pool = 1u;
+    uint32_t mtp_kv_dim = 0;
+    uint32_t mtp_sync_len = 0;
+    float *mtp_sync_slot = NULL;
+    bool mtp_ok = true;
+    bool mtp_saw_aligned = false;
+    bool mtp_saw_unaligned = false;
+    uint32_t mtp_point_len[GLM_MTP_SNAPSHOT_CYCLES + 2];
+    uint32_t mtp_point_mod[GLM_MTP_SNAPSHOT_CYCLES + 2];
+    int mtp_point_count = 0;
+    test_mtp_state reference_final = {0};
+    bool have_reference_final = false;
+    double snapshot_save_ms = 0.0;
+    double snapshot_load_ms = 0.0;
+    bool snapshot_timed = false;
 #ifdef DS4_ROCM_BUILD
     const float continued_logit_tolerance =
         ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
@@ -552,10 +844,50 @@ static void test_session_snapshot_roundtrip(void) {
             prompt.len, ctx, test_glm_mtp);
     TEST_ASSERT(ds4_session_sync(reference, &prompt, err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_top_logprobs(reference, before, 8) == 8);
-    TEST_ASSERT(ds4_session_save_snapshot(reference, &snapshot,
-                                          err, sizeof(err)) == 0);
+    {
+        const double t0 = test_now_ms();
+        const int rc = ds4_session_save_snapshot(reference, &snapshot,
+                                                 err, sizeof(err));
+        snapshot_save_ms = test_now_ms() - t0;
+        snapshot_timed = true;
+        TEST_ASSERT(rc == 0);
+    }
     TEST_ASSERT(snapshot.ptr != NULL && snapshot.len > 0);
     if (!snapshot.ptr || snapshot.len == 0) goto cleanup;
+
+    if (glm53_mtp) {
+        uint32_t cache_cap = 0;
+        uint32_t seam_embd = 0;
+        TEST_ASSERT(ds4_test_glm_mtp_cache_dims(reference, &mtp_kv_dim, NULL,
+                                                &mtp_pool, NULL, &cache_cap));
+        TEST_ASSERT(ds4_test_glm_mtp_seam_hidden(reference, NULL, 0, &seam_embd));
+        TEST_ASSERT(mtp_pool > 0 && mtp_kv_dim > 0);
+        mtp_sync_len = (uint32_t)ds4_session_pos(reference);
+        /* The checkpoint's last slot: the prefill had no next token for it, so
+         * it is still the zero the caches started with and the seam is what
+         * will fill it once the token exists. */
+        mtp_sync_slot = malloc((size_t)mtp_kv_dim * sizeof(float));
+        TEST_ASSERT(mtp_sync_slot != NULL);
+        TEST_ASSERT(mtp_sync_len > 0 &&
+                    ds4_test_glm_read_mtp_kv(reference, mtp_sync_len - 1u,
+                                             mtp_sync_slot, mtp_kv_dim,
+                                             NULL, 0, NULL, 0));
+        fprintf(stderr,
+                "ds4-test: snapshot sync slot %u all zero=%d complete=%d\n",
+                mtp_sync_len - 1u, test_mtp_row_zero(mtp_sync_slot, mtp_kv_dim),
+                ds4_test_glm_mtp_cache_complete(reference));
+        TEST_ASSERT(test_mtp_row_zero(mtp_sync_slot, mtp_kv_dim));
+        TEST_ASSERT(ds4_test_glm_mtp_cache_complete(reference));
+        /* Save point 1: the seam is pending. */
+        mtp_point_len[mtp_point_count] = mtp_sync_len;
+        mtp_point_mod[mtp_point_count] = mtp_sync_len % mtp_pool;
+        mtp_point_count++;
+        mtp_saw_aligned = mtp_sync_len % mtp_pool == 0u;
+        mtp_saw_unaligned = mtp_sync_len % mtp_pool != 0u;
+        mtp_ok = test_mtp_snapshot_point(reference, engine, ctx, "sync");
+        TEST_ASSERT(mtp_ok);
+        if (!mtp_ok) goto cleanup;
+    }
 
     FILE *payload = tmpfile();
     TEST_ASSERT(payload != NULL);
@@ -592,19 +924,75 @@ static void test_session_snapshot_roundtrip(void) {
             if (n <= 0 || n > 2) goto cleanup;
             reference_counts[cycle] = n;
             reference_total += n;
+            /* Save points 2..: after every cycle until both remainder classes
+             * of the pooled indexer have been exercised -- a checkpoint that
+             * ends on a pool boundary and one that stops inside a pool, which
+             * is where the seam sits in the middle of the raw tail. */
+            if (glm53_mtp && !(mtp_saw_aligned && mtp_saw_unaligned)) {
+                const uint32_t len = (uint32_t)ds4_session_pos(reference);
+                mtp_point_len[mtp_point_count] = len;
+                mtp_point_mod[mtp_point_count] = len % mtp_pool;
+                mtp_point_count++;
+                mtp_saw_aligned = mtp_saw_aligned || len % mtp_pool == 0u;
+                mtp_saw_unaligned = mtp_saw_unaligned || len % mtp_pool != 0u;
+                char tag[32];
+                snprintf(tag, sizeof(tag), "cycle %d", cycle + 1);
+                mtp_ok = test_mtp_snapshot_point(reference, engine, ctx, tag) &&
+                         mtp_ok;
+                TEST_ASSERT(mtp_ok);
+                if (!mtp_ok) goto cleanup;
+            }
         }
     } else {
         TEST_ASSERT(ds4_session_eval(reference, before[0].id,
                                      err, sizeof(err)) == 0);
     }
     TEST_ASSERT(ds4_session_top_logprobs(reference, reference_after, 8) == 8);
+    if (glm53_mtp) {
+        /* Save point at the end of every cycle, plus the reference's final
+         * nextn state kept on the host for the restored session to be
+         * compared against once it has run the same cycles. */
+        mtp_point_len[mtp_point_count] = (uint32_t)ds4_session_pos(reference);
+        mtp_point_mod[mtp_point_count] =
+            (uint32_t)ds4_session_pos(reference) % mtp_pool;
+        mtp_point_count++;
+        mtp_ok = test_mtp_snapshot_point(reference, engine, ctx, "last cycle") &&
+                 mtp_ok;
+        TEST_ASSERT(mtp_ok);
+        if (!mtp_ok) goto cleanup;
+        if (!mtp_saw_aligned || !mtp_saw_unaligned) {
+            for (int i = 0; i < mtp_point_count; i++) {
+                fprintf(stderr, "ds4-test: snapshot mtp save point %d len=%u mod=%u\n",
+                        i, mtp_point_len[i], mtp_point_mod[i]);
+            }
+            fprintf(stderr,
+                    "ds4-test: snapshot mtp save points never covered both "
+                    "checkpoint.len %% POOL classes (aligned=%d unaligned=%d)\n",
+                    mtp_saw_aligned, mtp_saw_unaligned);
+        }
+        TEST_ASSERT(mtp_saw_aligned && mtp_saw_unaligned);
+        have_reference_final = test_mtp_state_capture(reference, &reference_final);
+        TEST_ASSERT(have_reference_final);
+        if (!have_reference_final) goto cleanup;
+    }
     ds4_session_free(reference);
     reference = NULL;
 
     TEST_ASSERT(ds4_session_create(&restored, engine, ctx) == 0);
     if (!restored) goto cleanup;
-    TEST_ASSERT(ds4_session_load_snapshot(restored, &snapshot,
-                                          err, sizeof(err)) == 0);
+    {
+        const double t0 = test_now_ms();
+        const int rc = ds4_session_load_snapshot(restored, &snapshot,
+                                                 err, sizeof(err));
+        snapshot_load_ms = test_now_ms() - t0;
+        TEST_ASSERT(rc == 0);
+    }
+    if (ds4_engine_is_glm53(engine) && snapshot_timed) {
+        fprintf(stderr,
+                "ds4-test: snapshot sync snapshot=%" PRIu64 " bytes save=%.1fms "
+                "load=%.1fms\n",
+                (uint64_t)snapshot.len, snapshot_save_ms, snapshot_load_ms);
+    }
     {
         /* a loaded snapshot must save back byte-identical */
         ds4_session_snapshot again = {0};
@@ -661,6 +1049,53 @@ static void test_session_snapshot_roundtrip(void) {
                 single_cycles,
                 double_cycles,
                 restored_total);
+        if (glm53_mtp && have_reference_final) {
+            /* The seam the prompt-sync snapshot carried has to have been spent
+             * by now: the restored session filled the checkpoint's last slot
+             * of that prefix with the real next token, from the hidden the
+             * payload restored. */
+            test_mtp_state restored_final = {0};
+            mtp_ok = test_mtp_state_capture(restored, &restored_final);
+            TEST_ASSERT(mtp_ok);
+            if (mtp_ok) {
+                fprintf(stderr,
+                        "ds4-test: snapshot seam slot %u written=%d "
+                        "complete=%d/%d\n",
+                        mtp_sync_len - 1u,
+                        test_mtp_row_written(
+                            restored_final.kv +
+                                (uint64_t)(mtp_sync_len - 1u) * mtp_kv_dim,
+                            mtp_kv_dim),
+                        restored_final.complete, reference_final.complete);
+                TEST_ASSERT(test_mtp_row_written(
+                    restored_final.kv +
+                        (uint64_t)(mtp_sync_len - 1u) * mtp_kv_dim,
+                    mtp_kv_dim));
+                /* Slots below the save point, and the raw tail, are the same
+                 * bytes in both sessions at the same cycle end. */
+                mtp_ok = test_mtp_state_prefix_equal(&reference_final,
+                                                     &restored_final,
+                                                     mtp_sync_len, "prefix");
+                TEST_ASSERT(mtp_ok);
+            }
+            /* Slots above it are only printed: no measurement says they are
+             * bit-identical, only that they are close. */
+            if (mtp_ok && restored_final.len == reference_final.len) {
+                float max_abs = 0.0f;
+                for (uint32_t p = mtp_sync_len; p < reference_final.len; p++) {
+                    const float d = test_mtp_row_max_abs(
+                        reference_final.kv + (uint64_t)p * mtp_kv_dim,
+                        restored_final.kv + (uint64_t)p * mtp_kv_dim,
+                        mtp_kv_dim);
+                    if (d > max_abs) max_abs = d;
+                }
+                fprintf(stderr,
+                        "ds4-test: snapshot slots above the save point slots=%u "
+                        "kv max_abs=%.6g\n",
+                        reference_final.len - mtp_sync_len, max_abs);
+            }
+            test_mtp_state_free(&restored_final);
+        }
     } else {
         TEST_ASSERT(ds4_session_eval(restored, before[0].id,
                                      err, sizeof(err)) == 0);
@@ -713,10 +1148,226 @@ static void test_session_snapshot_roundtrip(void) {
 
 cleanup:
     free(prompt_text);
+    free(mtp_sync_slot);
+    test_mtp_state_free(&reference_final);
     ds4_tokens_free(&prompt);
     ds4_session_snapshot_free(&snapshot);
     ds4_session_free(restored);
     ds4_session_free(reference);
+}
+
+/* Cross-mode .kv read-back (ticket 006).  A .kv file's header says nothing
+ * about the MTP switch, so a server with MTP on and a server with it off read
+ * each other's files.  One run covers one side of that: DS4_TEST_PAYLOAD_MODE
+ * picks save or load, DS4_TEST_PAYLOAD_FILE names the file, and
+ * DS4_TEST_GLM_MTP decides whether this engine maintains the nextn caches at
+ * all.  Run it four ways to walk every combination. */
+
+static void test_glm_mtp_payload_cross_build_prompt(ds4_engine *engine,
+                                                    ds4_tokens *prompt) {
+    ds4_chat_begin(engine, prompt);
+    ds4_chat_append_message(engine, prompt, "user",
+                            "Give one concise reason to test session restore.");
+    ds4_chat_append_assistant_prefix(engine, prompt, DS4_THINK_NONE);
+}
+
+/* GLM_MTP_SNAPSHOT_CYCLES speculative cycles, or the same number of greedy
+ * tokens through the plain eval when the engine has no MTP.  Returns the
+ * committed token count. */
+static int test_glm_mtp_payload_cross_generate(ds4_session *s, int mtp,
+                                               int *out, int out_cap,
+                                               char *err, size_t errlen) {
+    int total = 0;
+    if (mtp) {
+        for (int cycle = 0; cycle < TEST_GLM_MTP_PAYLOAD_CYCLES; cycle++) {
+            const int first = ds4_session_argmax(s);
+            const int n = ds4_session_eval_speculative_argmax(
+                s, first, 2, -1, out + total, 2, err, errlen);
+            if (n <= 0 || total + n > out_cap) return -1;
+            total += n;
+        }
+        return total;
+    }
+    const int first = ds4_session_argmax(s);
+    if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
+    out[total++] = first;
+    while (total < TEST_GLM_MTP_PAYLOAD_CYCLES) {
+        const int next = ds4_session_argmax(s);
+        if (ds4_session_eval(s, next, err, errlen) != 0) return -1;
+        out[total++] = next;
+    }
+    return total;
+}
+
+static void test_glm_mtp_payload_cross(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine)) {
+        fprintf(stderr, "ds4-test: glm-mtp-payload-cross skipped "
+                        "(needs a GLM 5.3 model)\n");
+        return;
+    }
+    /* Whether this engine was opened with the GLM MTP head at all. */
+    const bool mtp_requested = test_env_bool("DS4_TEST_GLM_MTP");
+    const char *mode = getenv("DS4_TEST_PAYLOAD_MODE");
+    const char *path = getenv("DS4_TEST_PAYLOAD_FILE");
+    if (!mode || !mode[0] || !path || !path[0]) {
+        fprintf(stderr, "ds4-test: glm-mtp-payload-cross needs "
+                        "DS4_TEST_PAYLOAD_MODE=save|load and "
+                        "DS4_TEST_PAYLOAD_FILE=PATH\n");
+        TEST_ASSERT(false);
+        return;
+    }
+
+    char err[192] = {0};
+    ds4_tokens prompt = {0};
+    ds4_session *session = NULL;
+    ds4_session *cold = NULL;
+    FILE *fp = NULL;
+    int restored_tokens[TEST_GLM_MTP_PAYLOAD_CYCLES * 2] = {0};
+    int cold_tokens[TEST_GLM_MTP_PAYLOAD_CYCLES * 2] = {0};
+    const uint32_t ctx = 1024;
+    /* Whether this engine maintains the nextn caches at all. */
+    int mtp_engine = 0;
+
+    test_glm_mtp_payload_cross_build_prompt(engine, &prompt);
+    TEST_ASSERT(prompt.len > 0);
+
+    if (!strcmp(mode, "save")) {
+        TEST_ASSERT(ds4_session_create(&session, engine, ctx) == 0 && session);
+        TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+        mtp_engine = ds4_test_glm_mtp_cache_complete(session);
+        const uint64_t expected = ds4_session_payload_bytes(session);
+        fp = fopen(path, "wb");
+        TEST_ASSERT(fp != NULL);
+        if (!fp) goto cleanup;
+        TEST_ASSERT(ds4_session_save_payload(session, fp, err, sizeof(err)) == 0);
+        fflush(fp);
+        const long written = ftell(fp);
+        fclose(fp);
+        fp = NULL;
+        uint32_t seam_pos = 0;
+        int seam_written = -1;
+        int seam_kept = 0;
+        TEST_ASSERT(ds4_test_glm_mtp_seam_state(session, &seam_pos,
+                                                &seam_written, &seam_kept));
+        fprintf(stderr,
+                "ds4-test: glm-mtp-payload-cross save mtp=%d requested=%d len=%d "
+                "file=%ld bytes=%" PRIu64 " complete=%d seam_valid=%d seam_pos=%u\n",
+                mtp_engine, mtp_requested ? 1 : 0, ds4_session_pos(session),
+                written, expected, mtp_engine, seam_kept, seam_pos);
+        TEST_ASSERT(expected != 0 && (uint64_t)written == expected);
+        goto cleanup;
+    }
+    if (strcmp(mode, "load")) {
+        fprintf(stderr, "ds4-test: glm-mtp-payload-cross unknown mode %s\n", mode);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+
+    fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) goto cleanup;
+    TEST_ASSERT(fseek(fp, 0, SEEK_END) == 0);
+    const long size = ftell(fp);
+    TEST_ASSERT(size > 0);
+    rewind(fp);
+
+    TEST_ASSERT(ds4_session_create(&session, engine, ctx) == 0 && session);
+    const int load_rc = ds4_session_load_payload(session, fp, (uint64_t)size,
+                                                 err, sizeof(err));
+    fclose(fp);
+    fp = NULL;
+    /* A cold sync of the same prompt is the reference for everything below. */
+    TEST_ASSERT(ds4_session_create(&cold, engine, ctx) == 0 && cold);
+    TEST_ASSERT(ds4_session_sync(cold, &prompt, err, sizeof(err)) == 0);
+    mtp_engine = ds4_test_glm_mtp_cache_complete(cold);
+    fprintf(stderr,
+            "ds4-test: glm-mtp-payload-cross load mtp=%d requested=%d file=%ld "
+            "load_rc=%d complete=%d\n", mtp_engine, mtp_requested ? 1 : 0,
+            size, load_rc, ds4_test_glm_mtp_cache_complete(session));
+    if (load_rc != 0) {
+        /* The only file a session with live nextn caches refuses is one whose
+         * MTP section carries no caches: a miss, exactly like an unreadable
+         * file, and the caller prefills.  The trunk must not be left half
+         * restored. */
+        fprintf(stderr, "ds4-test: glm-mtp-payload-cross load refused: %s\n", err);
+        TEST_ASSERT(mtp_engine != 0);
+        TEST_ASSERT(!ds4_session_checkpoint_valid(session));
+        TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
+        TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session));
+    } else {
+        TEST_ASSERT(ds4_session_checkpoint_valid(session));
+        if (mtp_engine) {
+            /* A file this engine can draft from is a complete set of nextn
+             * caches plus a seam that still has its rewrite to run. */
+            uint32_t seam_pos = 0;
+            int seam_written = -1;
+            int seam_kept = 0;
+            TEST_ASSERT(ds4_test_glm_mtp_seam_state(session, &seam_pos,
+                                                    &seam_written, &seam_kept));
+            fprintf(stderr,
+                    "ds4-test: glm-mtp-payload-cross restored seam valid=%d "
+                    "pos=%u written=%d\n", seam_kept, seam_pos, seam_written);
+            TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session));
+            TEST_ASSERT(seam_kept != 0);
+        } else {
+            /* MTP off: the section was skipped whole, with no trailing bytes
+             * left over, and nothing claims the caches cover the checkpoint. */
+            TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
+        }
+    }
+    TEST_ASSERT(ds4_session_pos(session) == prompt.len);
+
+    {
+        ds4_token_score got[8];
+        ds4_token_score want[8];
+        TEST_ASSERT(ds4_session_top_logprobs(session, got, 8) == 8);
+        TEST_ASSERT(ds4_session_top_logprobs(cold, want, 8) == 8);
+        for (int i = 0; i < 8; i++) {
+            fprintf(stderr,
+                    "ds4-test: glm-mtp-payload-cross top[%d] cold=(%d,%.9g) "
+                    "restored=(%d,%.9g)\n", i, want[i].id, want[i].logit,
+                    got[i].id, got[i].logit);
+            TEST_ASSERT(got[i].id == want[i].id);
+            TEST_ASSERT(fabsf(got[i].logit - want[i].logit) <= 1e-6f);
+        }
+    }
+
+    {
+        const int n_restored = test_glm_mtp_payload_cross_generate(
+            session, mtp_engine, restored_tokens,
+            (int)(sizeof(restored_tokens) / sizeof(restored_tokens[0])),
+            err, sizeof(err));
+        TEST_ASSERT(n_restored > 0);
+        const int n_cold = test_glm_mtp_payload_cross_generate(
+            cold, mtp_engine, cold_tokens,
+            (int)(sizeof(cold_tokens) / sizeof(cold_tokens[0])),
+            err, sizeof(err));
+        TEST_ASSERT(n_cold > 0);
+        TEST_ASSERT(n_restored == n_cold);
+        if (n_restored == n_cold) {
+            for (int i = 0; i < n_restored; i++) {
+                if (restored_tokens[i] != cold_tokens[i]) {
+                    fprintf(stderr,
+                            "ds4-test: glm-mtp-payload-cross token %d "
+                            "cold=%d restored=%d\n", i, cold_tokens[i],
+                            restored_tokens[i]);
+                }
+                TEST_ASSERT(restored_tokens[i] == cold_tokens[i]);
+            }
+        }
+        fprintf(stderr,
+                "ds4-test: glm-mtp-payload-cross load ok mtp=%d tokens=%d "
+                "pos=%d/%d\n", mtp_engine, n_restored,
+                ds4_session_pos(session), ds4_session_pos(cold));
+    }
+
+cleanup:
+    if (fp) fclose(fp);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(session);
+    ds4_session_free(cold);
 }
 
 static uint64_t test_round_up_u64(uint64_t n, uint64_t align) {
@@ -9604,8 +10255,10 @@ static void test_glm_mtp_commit_fail_load(ds4_engine *engine,
         fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: %s\n", err);
         goto cleanup;
     }
-    /* A restored session has no hidden for its last position, so nothing it
-     * restored is readable until the payload carries one (ticket 005). */
+    /* The restored prefix stays below the read floor: the payload now carries
+     * the nextn caches and the seam (ticket 006), but which slots a draft may
+     * read is still the rule ticket 005 left, so the load keeps the floor a
+     * seam drop used to leave. */
     const uint32_t floor = ds4_test_glm_mtp_read_floor(restored);
     fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: pos=%d floor=%u\n",
             ds4_session_pos(restored), floor);
@@ -9799,6 +10452,7 @@ static const ds4_test_entry test_entries[] = {
     {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
     {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP drafts from the current request's first generated position after a resume or a disk-KV restore", test_glm_mtp_request_window},
     {"--glm-mtp-prefill", "glm-mtp-prefill", "GLM 5.3 MTP prefill writes the nextn KV and indexer caches, and the seam fills the row that waits for its token", test_glm_mtp_prefill_write},
+    {"--glm-mtp-payload-cross", "glm-mtp-payload-cross", "GLM 5.3 .kv files cross the MTP on/off boundary: complete caches restore the seam, a file without them is a miss", test_glm_mtp_payload_cross},
     {"--glm-mtp-commit-token", "glm-mtp-commit-token", "GLM 5.3 MTP slots hold the real committed token and their own position's hidden across plain steps, mixed sampling and resample rewinds", test_glm_mtp_commit_token},
     {"--glm-mtp-commit-exact", "glm-mtp-commit-exact", "GLM 5.3 MTP exact-sampling replacements reach the nextn slot they belong to", test_glm_mtp_commit_exact},
     {"--glm-mtp-commit-fail", "glm-mtp-commit-fail", "GLM 5.3 MTP makes a slot whose nextn write failed unreadable instead of leaving it stale", test_glm_mtp_commit_fail},
@@ -9840,6 +10494,8 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Pin the widest commit --glm-mtp-verify expects. Unset: DS4_GLM_MTP_DEPTH=2/3 expects that width, automatic depth only expects 2..3.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_TOKENS=N  Tokens to generate per request in --glm-mtp-window. Default: 64.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_CTX=N     Session context for --glm-mtp-window. Default: 4096.");
+    puts("  DS4_TEST_PAYLOAD_MODE=save|load   Which side of the MTP on/off boundary --glm-mtp-payload-cross exercises.");
+    puts("  DS4_TEST_PAYLOAD_FILE=PATH        .kv file --glm-mtp-payload-cross writes or reads.");
     puts("  DS4_GLM_MTP_LEGACY=1              Run the legacy GLM MTP cycle; --glm-mtp-commit-token covers it (its rewrites fill the nextn KV alone).");
     puts("  DS4_GLM_MTP_DEPTH=3               Required for --glm-mtp-commit-fail to cover the chained draft row.");
     puts("  DS4_TEST_LONG_PROMPT=FILE  Rendered long-context story fact prompt.");

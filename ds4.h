@@ -546,6 +546,18 @@ uint32_t ds4_test_glm_mtp_read_floor(ds4_session *s);
  * nextn caches. */
 int ds4_test_glm_mtp_seam_state(ds4_session *s, uint32_t *pos, int *written,
                                 int *hidden_kept);
+/* Test helpers (ds4-test, ticket 006): the seam's kept post-norm hidden and
+ * whether the nextn caches cover the whole checkpoint.  seam_hidden() reports
+ * the hidden row's float count in embd_values and copies it into hidden when
+ * hidden_cap is large enough; it reads the tensor whether or not the hidden is
+ * currently considered valid, so a test can compare byte for byte what a
+ * payload restored.  cache_complete() is 1 while every nextn slot
+ * [0, checkpoint.len-1] was written by a production path since the last cold
+ * prefill -- exactly the condition under which a snapshot saves the payload's
+ * MTP section with data. */
+int ds4_test_glm_mtp_seam_hidden(ds4_session *s, float *hidden,
+                                 uint32_t hidden_cap, uint32_t *embd_values);
+int ds4_test_glm_mtp_cache_complete(ds4_session *s);
 int ds4_test_glm_mtp_dense(ds4_session *s);
 void ds4_test_glm_mtp_fail_next(ds4_session *s, int kind);
 void ds4_test_glm_mtp_stats(ds4_session *s, uint32_t *rewrites,

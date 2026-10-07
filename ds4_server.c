@@ -21927,6 +21927,50 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     rmdir(dir);
 }
 
+/* The GLM-5.3 nextn (MTP) payload section (ticket 006) bumped the payload ABI
+ * from 2 to 3, and the byte is global: a file written by the previous ABI is a
+ * miss for every model, not just for the one that changed. */
+static void test_kv_cache_lookup_rejects_previous_payload_abi(void) {
+    char tmpl[] = "/tmp/ds4-kv-prev-abi-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "previous abi rendered prefix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        h[20] = 2; /* the ABI before the GLM-5.3 MTP payload section */
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "previous abi rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 static void test_kv_tool_map_filters_by_dsml_text(void) {
     const char *dsml_keep =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -23408,6 +23452,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_uses_longest_text_prefix();
     test_kv_cache_lookup_rejects_wrong_model();
     test_kv_cache_lookup_rejects_stale_payload_abi();
+    test_kv_cache_lookup_rejects_previous_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
     test_kv_cache_eviction_prefers_anchor_reason();
     test_kv_cache_eviction_makes_room_before_store();
