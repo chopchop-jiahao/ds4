@@ -39100,6 +39100,10 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
  * verify row with the decode scorer (measured on M3 Max: 8k slower, 64k faster). */
 #define DS4_GLM53_ROW_INDEXER_MIN_POS 16384u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
+/* Nextn prefill fill group: how many prompt rows one fill step encodes.  It
+ * only sizes fixed scratch, so it does not change the memory a filled token
+ * costs. */
+#define DS4_GLM53_MTP_FILL_ROWS 64u
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
                                              bool     ssd_streaming);
@@ -45199,6 +45203,46 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_hc_rows;         /* [3][hc][embd] */
     ds4_gpu_tensor *mtp_chain_hidden;    /* [embd] last MTP row after the head norm */
     ds4_gpu_tensor *mtp_hc_postnorm;     /* [embd] trunk output_norm of one mHC row */
+    /* GLM-5.3 nextn indexer caches: the pooled indexer key cache plus the
+     * tail/gate pair, mirroring what every trunk DSA layer keeps, so the
+     * nextn block can cover the whole context instead of only the drafted
+     * window.  The K tail owns the contiguous K+gate allocation; the gate is
+     * a view. */
+    ds4_gpu_tensor *mtp_indexer_key_cache;
+    ds4_gpu_tensor *mtp_indexer_tail_k;
+    ds4_gpu_tensor *mtp_indexer_tail_gate;
+    /* Fixed-capacity prefill fill scratch: one group of nextn rows at a time,
+     * so a filled prompt token costs only the pooled indexer key share. */
+    ds4_gpu_tensor *mtp_fill_tokens;       /* [fill_token_cap] int32, host-written */
+    ds4_gpu_tensor *mtp_fill_embed;        /* [rows][embd] */
+    ds4_gpu_tensor *mtp_fill_hidden;       /* [rows][embd] mHC mean */
+    ds4_gpu_tensor *mtp_fill_norm;         /* [rows][embd] trunk output_norm */
+    ds4_gpu_tensor *mtp_fill_concat;       /* [rows][2*embd] enorm|hnorm */
+    ds4_gpu_tensor *mtp_fill_x;            /* [rows][embd] eh_proj output */
+    ds4_gpu_tensor *mtp_fill_attn_norm;    /* [rows][embd] */
+    ds4_gpu_tensor *mtp_fill_kv_raw;       /* [rows][kv_raw_dim] */
+    ds4_gpu_tensor *mtp_fill_kv_norm;      /* [rows][kv_lora] */
+    ds4_gpu_tensor *mtp_fill_indexer_k;    /* [rows][indexer_head_dim] */
+    ds4_gpu_tensor *mtp_fill_indexer_gate; /* [rows][indexer_head_dim] */
+    uint32_t        mtp_fill_rows;         /* scratch rows per group */
+    uint32_t        mtp_fill_token_cap;    /* entries in mtp_fill_tokens */
+    /* Caller request for the prefill fill (see glm53_graph_mtp_note_prefill):
+     * the first mtp_fill_rows rows of the next prefill call write the nextn
+     * caches, taking their next token from the mtp_fill_next host array. */
+    uint32_t        mtp_fill_asked;
+    const int      *mtp_fill_next;
+    bool            mtp_seam_save;         /* caller: keep the last prefill row as the seam */
+    int32_t         mtp_seam_flush;        /* caller: token to write into the seam slot, or -1 */
+    int             mtp_indexer_store;     /* session enables nextn indexer writes */
+    /* The seam: the trunk post-norm hidden (mHC mean through output_norm) of
+     * the last position whose next token was not known when it was computed.
+     * Its nextn cache slot stays unwritten until the next token exists, so
+     * the nextn caches hold no hole over [0..checkpoint.len-1]. */
+    ds4_gpu_tensor *mtp_seam_hidden;       /* [embd] */
+    ds4_gpu_tensor *mtp_seam_token;        /* [1] int32, host-written */
+    uint32_t        mtp_seam_pos;
+    bool            mtp_seam_valid;
+    bool            mtp_seam_unwritten;    /* slot mtp_seam_pos has never been written */
     ds4_gpu_tensor *layer_indexer_key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_k[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_indexer_tail_gate[DS4_MAX_LAYER];
@@ -47022,14 +47066,11 @@ static bool glm_graph_verify_ws_switch(ds4_glm_gpu_graph *g,
 }
 #undef DS4_GLM_VERIFY_WS_FIELDS
 
-static void glm_graph_free(ds4_glm_gpu_graph *g) {
-    glm_graph_verify_ws_free(g);
-    glm_graph_ws_free(g);
+/* Release every GLM MTP (nextn block) resource.  Used by glm_graph_free() and
+ * by the lazy glm_graph_mtp_ensure() failure path, which must leave nothing
+ * behind.  Only frees handles; the caller still owns the graph struct. */
+static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     if (!g) return;
-    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
-        ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[tier]);
-        g->directional_steering_dirs_by_tier[tier] = NULL;
-    }
     ds4_gpu_tensor_free(g->mtp_kv_lora_cache);
     ds4_gpu_tensor_free(g->mtp_k_rope_cache);
     ds4_gpu_tensor_free(g->mtp_concat);
@@ -47044,6 +47085,22 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_hc_rows);
     ds4_gpu_tensor_free(g->mtp_chain_hidden);
     ds4_gpu_tensor_free(g->mtp_hc_postnorm);
+    ds4_gpu_tensor_free(g->mtp_indexer_tail_gate);
+    ds4_gpu_tensor_free(g->mtp_indexer_tail_k);
+    ds4_gpu_tensor_free(g->mtp_indexer_key_cache);
+    ds4_gpu_tensor_free(g->mtp_seam_hidden);
+    ds4_gpu_tensor_free(g->mtp_seam_token);
+    ds4_gpu_tensor_free(g->mtp_fill_tokens);
+    ds4_gpu_tensor_free(g->mtp_fill_embed);
+    ds4_gpu_tensor_free(g->mtp_fill_hidden);
+    ds4_gpu_tensor_free(g->mtp_fill_norm);
+    ds4_gpu_tensor_free(g->mtp_fill_concat);
+    ds4_gpu_tensor_free(g->mtp_fill_x);
+    ds4_gpu_tensor_free(g->mtp_fill_attn_norm);
+    ds4_gpu_tensor_free(g->mtp_fill_kv_raw);
+    ds4_gpu_tensor_free(g->mtp_fill_kv_norm);
+    ds4_gpu_tensor_free(g->mtp_fill_indexer_k);
+    ds4_gpu_tensor_free(g->mtp_fill_indexer_gate);
     free(g->mtp_logits_host);
     g->mtp_kv_lora_cache = NULL;
     g->mtp_k_rope_cache = NULL;
@@ -47059,8 +47116,45 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     g->mtp_hc_rows = NULL;
     g->mtp_chain_hidden = NULL;
     g->mtp_hc_postnorm = NULL;
+    g->mtp_indexer_tail_gate = NULL;
+    g->mtp_indexer_tail_k = NULL;
+    g->mtp_indexer_key_cache = NULL;
+    g->mtp_seam_hidden = NULL;
+    g->mtp_seam_token = NULL;
+    g->mtp_fill_tokens = NULL;
+    g->mtp_fill_embed = NULL;
+    g->mtp_fill_hidden = NULL;
+    g->mtp_fill_norm = NULL;
+    g->mtp_fill_concat = NULL;
+    g->mtp_fill_x = NULL;
+    g->mtp_fill_attn_norm = NULL;
+    g->mtp_fill_kv_raw = NULL;
+    g->mtp_fill_kv_norm = NULL;
+    g->mtp_fill_indexer_k = NULL;
+    g->mtp_fill_indexer_gate = NULL;
+    g->mtp_fill_rows = 0;
+    g->mtp_fill_token_cap = 0;
+    g->mtp_fill_asked = 0;
+    g->mtp_fill_next = NULL;
+    g->mtp_seam_save = false;
+    g->mtp_seam_flush = -1;
+    g->mtp_indexer_store = 0;
+    g->mtp_seam_pos = 0;
+    g->mtp_seam_valid = false;
+    g->mtp_seam_unwritten = false;
     g->mtp_logits_host = NULL;
     g->mtp_ready = 0;
+}
+
+static void glm_graph_free(ds4_glm_gpu_graph *g) {
+    glm_graph_verify_ws_free(g);
+    glm_graph_ws_free(g);
+    if (!g) return;
+    for (int tier = 0; tier < DS4_MAX_GPUS; tier++) {
+        ds4_gpu_tensor_free(g->directional_steering_dirs_by_tier[tier]);
+        g->directional_steering_dirs_by_tier[tier] = NULL;
+    }
+    glm_graph_mtp_free(g);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
@@ -51372,12 +51466,23 @@ static bool glm_graph_begin_commands_if_needed(void);
  * blk.(N_LAYER-1) is GLM 5.2's multi-token-prediction block: a full
  * attention+MoE layer fed with eh_proj(concat(enorm(embed(token[p+1])),
  * hnorm(h[p]))), predicting token[p+2] through the shared output head.
- * It keeps a private compact KV cache (slot = absolute position; only
- * positions >= mtp_min_pos are ever selected, so the unwritten prompt
- * range is never read). Under TP the routed experts are combined over
- * the BIG-gate exchange, never the decode row gate, so the RDMA row-gate
- * schedule stays intact.
+ * It keeps a private compact KV cache plus (GLM-5.3) a private pooled indexer
+ * key cache, both slot-addressed by absolute position.  From ticket 004 on the
+ * GLM-5.3 caches are written for every position the checkpoint holds -- prefill
+ * rows included -- so the whole [0..checkpoint.len-1] range is covered.  The
+ * only position that ever lags is the newest one, whose next token does not
+ * exist yet: its post-norm trunk hidden is parked in the seam and its slot is
+ * written as soon as the token does exist.  Positions past the checkpoint stay
+ * unwritten, and the drafter only ever selects positions <= checkpoint.len-1
+ * (its own current row included), so no unwritten slot is ever read.  GLM-5.2
+ * has no indexer and its cache stays the drafted-window-only design.
  * --------------------------------------------------------------------- */
+/* Capacity of the nextn KV and indexer caches, in slots: the same slot count
+ * the trunk's compact cache uses (its full-attention context when the compact
+ * cache is not sized).  Since ticket 004 prefill writes a nextn row for every
+ * prompt position, so the slots have to cover the whole trunk context, not the
+ * draft window.  Every position handed to the fill, the seam or a draft step
+ * must satisfy pos < glm_graph_mtp_cache_cap(g). */
 static uint32_t glm_graph_mtp_cache_cap(const ds4_glm_gpu_graph *g) {
     if (!g) return 0;
     return g->compact_cache_cap != 0 ? g->compact_cache_cap : g->ctx_size;
@@ -51521,6 +51626,51 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         g->mtp_hc_rows = ds4_gpu_tensor_alloc(3ull * DS4_N_HC * DS4_N_EMBD * sizeof(float));
         g->mtp_chain_hidden = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
         g->mtp_hc_postnorm = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        /* The nextn block keeps the same pooled indexer key cache + tail/gate
+         * pair a trunk DSA layer keeps (capacity = pooled rows, tail = one
+         * pool window of raw keys with the gate as a view into the K tail). */
+        const uint64_t mtp_pool_rows = glm53_graph_indexer_pool_cap(cache_cap);
+        const uint64_t mtp_indexer_key_bytes =
+            mtp_pool_rows * DS4_N_INDEXER_HEAD_DIM * elem;
+        const uint64_t mtp_indexer_tail_bytes =
+            (uint64_t)DS4_GLM53_INDEX_POOL_SIZE * DS4_N_INDEXER_HEAD_DIM *
+            sizeof(float);
+        g->mtp_indexer_key_cache = ds4_gpu_tensor_alloc(mtp_indexer_key_bytes);
+        g->mtp_indexer_tail_k =
+            ds4_gpu_tensor_alloc(2u * mtp_indexer_tail_bytes);
+        if (g->mtp_indexer_tail_k) {
+            g->mtp_indexer_tail_gate = ds4_gpu_tensor_view(
+                g->mtp_indexer_tail_k, mtp_indexer_tail_bytes,
+                mtp_indexer_tail_bytes);
+        }
+        /* The seam hidden is a fixed [embd] slot: it does not follow --ctx. */
+        g->mtp_seam_hidden = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
+        g->mtp_seam_token = ds4_gpu_tensor_alloc(sizeof(int32_t));
+        /* Prefill fill scratch: one group of rows at a time, plus the host
+         * token ids of the whole requested range (ds4_gpu_tensor_write() lands
+         * immediately, so the ids cannot share one group-sized buffer). */
+        g->mtp_fill_rows = DS4_GLM53_MTP_FILL_ROWS;
+        g->mtp_fill_token_cap = g->indexed_prefill_cap != 0 ?
+            g->indexed_prefill_cap : DS4_GLM53_MTP_FILL_ROWS;
+        const uint64_t rows = g->mtp_fill_rows;
+        const uint64_t embd_rows = rows * DS4_N_EMBD * sizeof(float);
+        g->mtp_fill_tokens =
+            ds4_gpu_tensor_alloc((uint64_t)g->mtp_fill_token_cap * sizeof(int32_t));
+        g->mtp_fill_embed = ds4_gpu_tensor_alloc(embd_rows);
+        g->mtp_fill_hidden = ds4_gpu_tensor_alloc(embd_rows);
+        g->mtp_fill_norm = ds4_gpu_tensor_alloc(embd_rows);
+        g->mtp_fill_concat = ds4_gpu_tensor_alloc(2ull * embd_rows);
+        g->mtp_fill_x = ds4_gpu_tensor_alloc(embd_rows);
+        g->mtp_fill_attn_norm = ds4_gpu_tensor_alloc(embd_rows);
+        g->mtp_fill_kv_raw = ds4_gpu_tensor_alloc(
+            rows * (g->kv_raw_dim != 0 ? g->kv_raw_dim : DS4_N_KV_LORA) *
+            sizeof(float));
+        g->mtp_fill_kv_norm =
+            ds4_gpu_tensor_alloc(rows * DS4_N_KV_LORA * sizeof(float));
+        g->mtp_fill_indexer_k = ds4_gpu_tensor_alloc(
+            rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        g->mtp_fill_indexer_gate = ds4_gpu_tensor_alloc(
+            rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -51529,49 +51679,51 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
                       !g->mtp_rows_hidden || !g->mtp_rows_norm ||
                       !g->mtp_rows_logits_gpu || !g->mtp_embed_rows ||
                       !g->mtp_hc_rows || !g->mtp_chain_hidden ||
-                      !g->mtp_hc_postnorm)) ||
+                      !g->mtp_hc_postnorm || !g->mtp_indexer_key_cache ||
+                      !g->mtp_indexer_tail_k || !g->mtp_indexer_tail_gate ||
+                      !g->mtp_seam_hidden || !g->mtp_seam_token ||
+                      !g->mtp_fill_tokens || !g->mtp_fill_embed ||
+                      !g->mtp_fill_hidden ||
+                      !g->mtp_fill_norm || !g->mtp_fill_concat ||
+                      !g->mtp_fill_x || !g->mtp_fill_attn_norm ||
+                      !g->mtp_fill_kv_raw || !g->mtp_fill_kv_norm ||
+                      !g->mtp_fill_indexer_k || !g->mtp_fill_indexer_gate)) ||
         !g->mtp_logits_host) {
         fprintf(stderr,
                 "ds4: glm mtp: allocation failed kv=%s rope=%s concat=%s "
-                "selected=%s state_backup=%s logits=%s\n",
+                "selected=%s state_backup=%s indexer_pool=%s fill=%s logits=%s\n",
                 g->mtp_kv_lora_cache ? "ok" : "missing",
                 g->mtp_k_rope_cache ? "ok" : "missing",
                 g->mtp_concat ? "ok" : "missing",
                 g->mtp_selected ? "ok" : "missing",
                 (!g->glm53 || g->mtp_state_backup) ? "ok" : "missing",
+                (!g->glm53 || g->mtp_indexer_key_cache) ? "ok" : "missing",
+                (!g->glm53 || g->mtp_fill_concat) ? "ok" : "missing",
                 g->mtp_logits_host ? "ok" : "missing");
-        ds4_gpu_tensor_free(g->mtp_kv_lora_cache);
-        ds4_gpu_tensor_free(g->mtp_k_rope_cache);
-        ds4_gpu_tensor_free(g->mtp_concat);
-        ds4_gpu_tensor_free(g->mtp_selected);
-        ds4_gpu_tensor_free(g->mtp_state_backup);
-        ds4_gpu_tensor_free(g->mtp_state_row[0]);
-        ds4_gpu_tensor_free(g->mtp_state_row[1]);
-        ds4_gpu_tensor_free(g->mtp_rows_hidden);
-        ds4_gpu_tensor_free(g->mtp_rows_norm);
-        ds4_gpu_tensor_free(g->mtp_rows_logits_gpu);
-        ds4_gpu_tensor_free(g->mtp_embed_rows);
-        ds4_gpu_tensor_free(g->mtp_hc_rows);
-        ds4_gpu_tensor_free(g->mtp_chain_hidden);
-        ds4_gpu_tensor_free(g->mtp_hc_postnorm);
-        free(g->mtp_logits_host);
-        g->mtp_kv_lora_cache = NULL;
-        g->mtp_k_rope_cache = NULL;
-        g->mtp_concat = NULL;
-        g->mtp_selected = NULL;
-        g->mtp_state_backup = NULL;
-        g->mtp_state_row[0] = NULL;
-        g->mtp_state_row[1] = NULL;
-        g->mtp_rows_hidden = NULL;
-        g->mtp_rows_norm = NULL;
-        g->mtp_rows_logits_gpu = NULL;
-        g->mtp_embed_rows = NULL;
-        g->mtp_hc_rows = NULL;
-        g->mtp_chain_hidden = NULL;
-        g->mtp_hc_postnorm = NULL;
-        g->mtp_logits_host = NULL;
+        glm_graph_mtp_free(g);
         return false;
     }
+    if (g->glm53) {
+        /* The tail is read back for the rows of a pool that a later write
+         * completes, so it has to start at zero like the trunk tails. */
+        const uint64_t tail_values =
+            (uint64_t)DS4_GLM53_INDEX_POOL_SIZE * DS4_N_INDEXER_HEAD_DIM;
+        if (ds4_gpu_tensor_fill_f32(g->mtp_indexer_tail_k, 0.0f,
+                                    tail_values) == 0 ||
+            ds4_gpu_tensor_fill_f32(g->mtp_indexer_tail_gate, 0.0f,
+                                    tail_values) == 0) {
+            fprintf(stderr, "ds4: glm mtp: indexer tail reset failed\n");
+            glm_graph_mtp_free(g);
+            return false;
+        }
+    }
+    g->mtp_seam_flush = -1;
+    g->mtp_fill_asked = 0;
+    g->mtp_fill_next = NULL;
+    g->mtp_seam_save = false;
+    g->mtp_seam_valid = false;
+    g->mtp_seam_unwritten = false;
+    g->mtp_seam_pos = 0;
     g->mtp_ready = 1;
     return true;
 }
@@ -51644,6 +51796,11 @@ static bool glm_graph_mtp_matmul(
  *   then put through the trunk's output_norm, so the nextn block is conditioned
  *   on the same post-norm hidden the trunk head turns into logits (vLLM
  *   glm5next feeds MTP the value after the final model norm).
+ * indexer_store: also write the nextn indexer key, gate and pool entry for
+ *   slot pos with the blk.45 indexer weights, exactly like a trunk DSA layer
+ *   writes its own.  vLLM's glm5next MLA runs the nextn indexer for every row
+ *   that reads the trunk hidden and skips it only for the chained draft
+ *   (skip_topk), so the chained caller passes false.
  * Callers write g->mtp_selected and every input row before encoding. */
 static bool glm_graph_mtp_encode_row(
         ds4_glm_gpu_graph    *g,
@@ -51652,6 +51809,7 @@ static bool glm_graph_mtp_encode_row(
         const ds4_gpu_tensor *embed_row,
         const ds4_gpu_tensor *hidden,
         bool                  hidden_hc,
+        bool                  indexer_store,
         uint32_t              pos,
         uint32_t              n_selected,
         const char          **stage_out) {
@@ -51661,6 +51819,12 @@ static bool glm_graph_mtp_encode_row(
     const float rope_base = layer_rope_freq_base(il);
     const float rope_scale = layer_rope_freq_scale(il);
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    const bool store_indexer = indexer_store && g->glm53 &&
+            g->mtp_indexer_store && g->mtp_indexer_key_cache &&
+            g->mtp_indexer_tail_k && g->mtp_indexer_tail_gate &&
+            l->indexer_attn_k && l->indexer_compressor_gate &&
+            l->indexer_k_norm && l->indexer_k_norm_b &&
+            l->indexer_compressor_ape;
     const char *mtp_stage = "enorm";
     bool ok = true;
     ds4_gpu_tensor *enorm_view =
@@ -51677,13 +51841,21 @@ static bool glm_graph_mtp_encode_row(
     }
 #define DS4_GLM_MTP_STAGE(name_) do { if (ok) mtp_stage = (name_); } while (0)
     DS4_GLM_MTP_STAGE("enorm");
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(enorm_view,
-                                                embed_row,
-                                                model->map,
-                                                model->size,
-                                                l->nextn_enorm->abs_offset,
-                                                DS4_N_EMBD,
-                                                DS4_RMS_EPS) != 0;
+    if (ok && g->glm53 && pos == 0u) {
+        /* vLLM fused_eh_norm masks the position-0 embedding to zero *before*
+         * enorm, and RMSNorm(0) is exactly 0, so the embedding half of the
+         * eh_proj input is zero.  Filling it is cheaper than embedding the
+         * token and zeroing it, and it makes slot 0 independent of the token. */
+        ok = ds4_gpu_tensor_fill_f32(enorm_view, 0.0f, DS4_N_EMBD) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_rms_norm_weight_tensor(enorm_view,
+                                            embed_row,
+                                            model->map,
+                                            model->size,
+                                            l->nextn_enorm->abs_offset,
+                                            DS4_N_EMBD,
+                                            DS4_RMS_EPS) != 0;
+    }
     const ds4_gpu_tensor *target_hidden = hidden;
     if (ok && hidden_hc) {
         /* vLLM's glm5next hands the nextn block the trunk hidden taken *after*
@@ -51723,7 +51895,9 @@ static bool glm_graph_mtp_encode_row(
                                       2u * DS4_N_EMBD,
                                       DS4_N_EMBD,
                                       g->mtp_concat);
-    /* nextn attention (full causal over the MTP window, no indexer). */
+    /* nextn attention (full causal over the MTP window, no indexer: the
+     * window is selected by position, ticket 001).  The row's own indexer
+     * key/pool entry above is written for the cache, not read here. */
     DS4_GLM_MTP_STAGE("attn_norm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
                                                 g->cur,
@@ -51801,6 +51975,50 @@ static bool glm_graph_mtp_encode_row(
                                                      DS4_N_KV_LORA,
                                                      DS4_N_ROT,
                                                      glm_graph_compact_cache_is_f16()) != 0;
+    /* The nextn block's own indexer: same key/gate projections and pooled
+     * store a trunk DSA layer runs on its attn_norm row, with the blk.45
+     * weights.  vLLM runs it for every row fed by the trunk hidden and skips
+     * it only for the chained draft (mla.py: if self.indexer and is_sparse
+     * and not self.skip_topk). */
+    if (ok && store_indexer) {
+        DS4_GLM_MTP_STAGE("indexer_k");
+        ok = glm53_graph_matmul_rows(g->indexer_k,
+                                     model,
+                                     l->indexer_attn_k,
+                                     DS4_N_EMBD,
+                                     DS4_N_INDEXER_HEAD_DIM,
+                                     g->attn_norm,
+                                     1) != 0;
+        if (ok) ok = glm53_graph_matmul_rows(
+                g->indexer_gate,
+                model,
+                l->indexer_compressor_gate,
+                DS4_N_EMBD,
+                DS4_N_INDEXER_HEAD_DIM,
+                g->attn_norm,
+                1);
+        if (ok) {
+            DS4_GLM_MTP_STAGE("indexer_pool");
+            ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                    g->mtp_indexer_key_cache,
+                    g->mtp_indexer_tail_k,
+                    g->mtp_indexer_tail_gate,
+                    g->indexer_k,
+                    g->indexer_gate,
+                    model->map,
+                    model->size,
+                    l->indexer_k_norm->abs_offset,
+                    l->indexer_k_norm_b->abs_offset,
+                    l->indexer_compressor_ape->abs_offset,
+                    pos,
+                    1,
+                    cache_cap,
+                    DS4_N_INDEXER_HEAD_DIM,
+                    DS4_GLM53_INDEX_POOL_SIZE,
+                    1.0e-6f,
+                    glm_graph_compact_cache_is_f16()) != 0;
+        }
+    }
     DS4_GLM_MTP_STAGE("qk_low");
     if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(g->qk_low,
                                                      g->q,
@@ -51968,11 +52186,23 @@ static bool glm_graph_mtp_encode_row(
 }
 
 
+/* Park one row's post-norm trunk hidden in the seam slot (defined with the
+ * nextn fill helpers below). */
+static bool glm53_graph_mtp_seam_store(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        ds4_gpu_tensor    *hc_row,
+        uint32_t           pos,
+        bool               slot_unwritten);
+
+
 /* One MTP step at (absolute) position pos: consumes the main model's last
  * hidden h[pos] (g->cur for GLM-5.2; for GLM-5.3 the mHC row g->hc_cur, which
  * encode_row reduces and puts through output_norm) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
- * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
+ * drafted token[pos+2] by greedy argmax.  g->mtp_seam_save additionally parks
+ * this row's post-norm hidden as the seam.  Clobbers the decode scratch. */
 static bool glm_graph_mtp_step(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52055,6 +52285,7 @@ static bool glm_graph_mtp_step(
                                           g->next,
                                           g->glm53 ? g->hc_cur : g->cur,
                                           g->glm53,
+                                          true,
                                           pos,
                                           n_selected,
                                           &mtp_stage);
@@ -52083,6 +52314,24 @@ static bool glm_graph_mtp_step(
                                       DS4_N_EMBD,
                                       DS4_N_VOCAB,
                                       g->output_norm);
+    if (ok && g->mtp_seam_save && g->glm53) {
+        /* This row is the last position the request now owns; keep its
+         * post-norm hidden so its nextn slot can be rewritten with the real
+         * next token as soon as one exists. */
+        g->mtp_seam_save = false;
+        if (!glm53_graph_mtp_seam_store(g, model, weights, g->hc_cur, pos,
+                                        false)) {
+            fprintf(stderr, "ds4: glm mtp: seam save at pos %u failed\n", pos);
+        }
+    }
+    if (ok && g->glm53 && g->mtp_seam_valid && g->mtp_seam_pos == pos) {
+        /* encode_row above wrote this step's slot with the decode kernels, so
+         * the seam parked at this position is no longer a row prefill left
+         * unwritten.  Only a never-written seam row is worth a batched rewrite
+         * on the next request; leaving the flag set would spend one on a slot
+         * this very step just filled. */
+        g->mtp_seam_unwritten = false;
+    }
     DS4_GLM_MTP_STAGE("end");
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
@@ -52184,7 +52433,8 @@ static bool glm53_graph_mtp_rows(
         ds4_gpu_tensor *h_row = ds4_gpu_tensor_view(g->mtp_hc_rows, t * hc_row_bytes, hc_row_bytes);
         ok = e_row && h_row &&
              glm_graph_mtp_encode_row(g, model, weights, e_row, h_row, true,
-                                      pos + t, pos + t - min_pos + 1u, &mtp_stage);
+                                      true, pos + t, pos + t - min_pos + 1u,
+                                      &mtp_stage);
         ds4_gpu_tensor_free(h_row);
         ds4_gpu_tensor_free(e_row);
     }
@@ -52202,6 +52452,18 @@ static bool glm53_graph_mtp_rows(
                                      emb_bytes) != 0;
     if (ok) ok = glm_graph_mtp_matmul(g, g->logits, model, weights->output,
                                       DS4_N_EMBD, DS4_N_VOCAB, g->output_norm);
+    if (ok && g->mtp_seam_save) {
+        /* The last catch-up row is the last position the request now owns. */
+        g->mtp_seam_save = false;
+        ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+                g->mtp_hc_rows, (uint64_t)(n - 1u) * hc_row_bytes, hc_row_bytes);
+        if (!glm53_graph_mtp_seam_store(g, model, weights, last,
+                                        pos + n - 1u, false)) {
+            fprintf(stderr, "ds4: glm mtp: seam save at pos %u failed\n",
+                    pos + n - 1u);
+        }
+        ds4_gpu_tensor_free(last);
+    }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (ok) ok = ds4_gpu_tensor_read(g->logits, 0, g->mtp_logits_host,
@@ -52260,6 +52522,7 @@ static bool glm53_graph_mtp_chain(
     if (ok) ok = glm_graph_mtp_embed_token(g, model, weights, next_token, g->next);
     if (ok) ok = glm_graph_mtp_encode_row(g, model, weights, g->next,
                                          g->mtp_chain_hidden, false,
+                                         false,
                                          pos, n_selected, &mtp_stage);
     if (ok) mtp_stage = "head";
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
@@ -52294,6 +52557,426 @@ static bool glm53_graph_mtp_chain(
     }
     *draft_out = best;
     return true;
+}
+
+
+/* ------------------------------------------------------------------------
+ * GLM-5.3 nextn cache fill (vLLM glm5next parity).
+ *
+ * vLLM's drafter keeps its KV and indexer caches dense over the whole
+ * context, prefill included: "the prefill forward pass above already ran to
+ * keep the drafter KV cache in sync" (llm_base_proposer.py), and row p of the
+ * nextn block is fed (token[p+1], trunk hidden[p] after the final model norm).
+ * ds4 writes the same thing from the attention-free prefix of a nextn row --
+ * eh_proj -> attn_norm -> kv_a -> kv_norm -> kv store -> indexer key/gate/pool
+ * -- with the blk.45 weights.  The last row of a processed range has no known
+ * next token yet, so its post-norm trunk hidden is parked in the seam and the
+ * slot is written the moment the token exists.
+ *
+ * Only the row prefix runs: the nextn attention and MoE are the drafter's own
+ * work and stay in glm_graph_mtp_encode_row().
+ * --------------------------------------------------------------------- */
+
+/* Drop the caller's nextn cache requests; used when a prefill call did not
+ * reach the point where they would have been consumed. */
+static void glm53_graph_mtp_clear_requests(ds4_glm_gpu_graph *g) {
+    if (!g) return;
+    g->mtp_fill_asked = 0;
+    g->mtp_fill_next = NULL;
+    g->mtp_seam_flush = -1;
+    g->mtp_seam_save = false;
+}
+
+static bool glm53_graph_mtp_fill_supported(
+        const ds4_glm_gpu_graph *g,
+        const ds4_weights       *weights) {
+    if (!g || !g->glm53 || !g->mtp_ready || !weights) return false;
+    if (!g->mtp_indexer_store || !g->mtp_kv_lora_cache || !g->mtp_k_rope_cache ||
+        !g->mtp_indexer_key_cache || !g->mtp_indexer_tail_k ||
+        !g->mtp_indexer_tail_gate || !g->hc_mean_weights ||
+        !g->mtp_fill_tokens || !g->mtp_fill_embed || !g->mtp_fill_hidden ||
+        !g->mtp_fill_norm || !g->mtp_fill_concat || !g->mtp_fill_x ||
+        !g->mtp_fill_attn_norm || !g->mtp_fill_kv_raw || !g->mtp_fill_kv_norm ||
+        !g->mtp_fill_indexer_k || !g->mtp_fill_indexer_gate) {
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &weights->layer[il];
+    return l->nextn_enorm && l->nextn_hnorm && l->nextn_eh_proj &&
+           l->attn_norm && l->attn_kv_a_mqa && l->attn_kv_a_norm &&
+           l->indexer_attn_k && l->indexer_compressor_gate &&
+           l->indexer_k_norm && l->indexer_k_norm_b &&
+           l->indexer_compressor_ape && weights->output_norm;
+}
+
+/* Encode the attention-free prefix of n nextn rows at absolute positions
+ * [pos0 .. pos0+n-1] into the currently open command batch.  Row r consumes
+ * the token next_tokens[r] (= the token at position pos0+r+1) and either the
+ * mHC row hc_rows[r] (reduced and put through output_norm here) or the already
+ * post-norm row postnorm_rows[r], and writes nextn KV slot pos0+r plus the
+ * nextn indexer key, gate and pooled entry.  token_scratch is device scratch
+ * for the ids; it must not alias anything another row of the same batch reads
+ * (host writes land immediately).  Nothing is read back and no command batch
+ * is opened or closed here. */
+static bool glm53_graph_mtp_fill_rows(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const int         *next_tokens,
+        ds4_gpu_tensor    *token_scratch,
+        ds4_gpu_tensor    *hc_rows,
+        ds4_gpu_tensor    *postnorm_rows,
+        uint32_t           pos0,
+        uint32_t           n) {
+    if (!g || !model || !weights || !next_tokens || !token_scratch || n == 0 ||
+        (hc_rows == NULL) == (postnorm_rows == NULL) ||
+        !glm53_graph_mtp_fill_supported(g, weights) ||
+        (uint64_t)n > g->mtp_fill_token_cap) {
+        return false;
+    }
+    const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const ds4_layer_weights *l = &weights->layer[il];
+    const uint32_t kv_raw_dim = (uint32_t)l->attn_kv_a_mqa->dim[1];
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t idx_bytes =
+        (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    const bool embed_bf16 = weights->token_embd &&
+        weights->token_embd->type == DS4_TENSOR_BF16;
+    if (pos0 >= cache_cap || n > cache_cap - pos0 ||
+        (uint64_t)kv_raw_dim * g->mtp_fill_rows * sizeof(float) >
+            ds4_gpu_tensor_bytes(g->mtp_fill_kv_raw)) {
+        return false;
+    }
+    if (!embed_bf16 && (!weights->token_embd || !g->prefill_tokens)) return false;
+    /* Host writes are immediate, so every id of the whole range goes up
+     * before any of it is encoded. */
+    if (ds4_gpu_tensor_write(token_scratch, 0, next_tokens,
+                             (uint64_t)n * sizeof(int32_t)) == 0) {
+        return false;
+    }
+    bool ok = true;
+    for (uint32_t first = 0; ok && first < n; first += g->mtp_fill_rows) {
+        const uint32_t rows =
+            g->mtp_fill_rows < n - first ? g->mtp_fill_rows : n - first;
+        const uint32_t pos = pos0 + first;
+        ds4_gpu_tensor *ids = ds4_gpu_tensor_view(token_scratch,
+                                                  (uint64_t)first * sizeof(int32_t),
+                                                  (uint64_t)rows * sizeof(int32_t));
+        ds4_gpu_tensor *embed = ds4_gpu_tensor_view(g->mtp_fill_embed, 0,
+                                                    rows * embd_bytes);
+        ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(g->mtp_fill_hidden, 0,
+                                                     rows * embd_bytes);
+        ds4_gpu_tensor *norm = ds4_gpu_tensor_view(g->mtp_fill_norm, 0,
+                                                   rows * embd_bytes);
+        ds4_gpu_tensor *concat = ds4_gpu_tensor_view(g->mtp_fill_concat, 0,
+                                                     rows * 2ull * embd_bytes);
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->mtp_fill_x, 0,
+                                                rows * embd_bytes);
+        ds4_gpu_tensor *attn_norm = ds4_gpu_tensor_view(g->mtp_fill_attn_norm, 0,
+                                                        rows * embd_bytes);
+        ds4_gpu_tensor *kv_raw = ds4_gpu_tensor_view(
+                g->mtp_fill_kv_raw, 0,
+                (uint64_t)rows * kv_raw_dim * sizeof(float));
+        ds4_gpu_tensor *kv_norm = ds4_gpu_tensor_view(
+                g->mtp_fill_kv_norm, 0,
+                (uint64_t)rows * DS4_N_KV_LORA * sizeof(float));
+        ds4_gpu_tensor *idx_k = ds4_gpu_tensor_view(g->mtp_fill_indexer_k, 0,
+                                                    rows * idx_bytes);
+        ds4_gpu_tensor *idx_gate = ds4_gpu_tensor_view(g->mtp_fill_indexer_gate, 0,
+                                                       rows * idx_bytes);
+        if (!ids || !embed || !hidden || !norm || !concat || !x || !attn_norm ||
+            !kv_raw || !kv_norm || !idx_k || !idx_gate) {
+            ok = false;
+        }
+        if (ok) {
+            ok = embed_bf16 ?
+                ds4_gpu_glm53_embedding_bf16(embed,
+                                             model->map,
+                                             model->size,
+                                             weights->token_embd->abs_offset,
+                                             ids,
+                                             rows,
+                                             DS4_N_EMBD,
+                                             DS4_N_VOCAB) != 0 :
+                ds4_gpu_embed_tokens_quant_tensor(embed,
+                                                  ids,
+                                                  model->map,
+                                                  model->size,
+                                                  weights->token_embd->abs_offset,
+                                                  weights->token_embd->type,
+                                                  DS4_N_VOCAB,
+                                                  rows,
+                                                  DS4_N_EMBD) != 0;
+        }
+        /* enorm (into the eh_proj input's first half) and the mHC mean. */
+        for (uint32_t r = 0; ok && r < rows; r++) {
+            ds4_gpu_tensor *enorm_row = ds4_gpu_tensor_view(
+                    concat, (uint64_t)r * 2ull * embd_bytes, embd_bytes);
+            ds4_gpu_tensor *embed_row = ds4_gpu_tensor_view(
+                    embed, (uint64_t)r * embd_bytes, embd_bytes);
+            ds4_gpu_tensor *hidden_row = postnorm_rows ? NULL :
+                ds4_gpu_tensor_view(hidden, (uint64_t)r * embd_bytes, embd_bytes);
+            /* A whole mHC row: hc_weighted_sum reads n_hc * n_embd floats, so
+             * the view must span the full row, not one stream of it. */
+            ds4_gpu_tensor *hc_row = postnorm_rows ? NULL :
+                glm_graph_tensor_row_view_strided(hc_rows, first + r,
+                                                  DS4_N_HC * DS4_N_EMBD,
+                                                  DS4_N_HC * DS4_N_EMBD);
+            if (!enorm_row || !embed_row ||
+                (!postnorm_rows && (!hidden_row || !hc_row))) {
+                ok = false;
+            }
+            /* vLLM fused_eh_norm: e = where(pos == 0, 0, e) before enorm, and
+             * RMSNorm(0) is exactly 0. */
+            if (ok && pos + r == 0u) {
+                ok = ds4_gpu_tensor_fill_f32(enorm_row, 0.0f, DS4_N_EMBD) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_rms_norm_weight_tensor(enorm_row,
+                                                    embed_row,
+                                                    model->map,
+                                                    model->size,
+                                                    l->nextn_enorm->abs_offset,
+                                                    DS4_N_EMBD,
+                                                    DS4_RMS_EPS) != 0;
+            }
+            if (ok && !postnorm_rows) {
+                ok = ds4_gpu_hc_weighted_sum_tensor(hidden_row,
+                                                    hc_row,
+                                                    g->hc_mean_weights,
+                                                    DS4_N_EMBD,
+                                                    DS4_N_HC) != 0;
+            }
+            ds4_gpu_tensor_free(hc_row);
+            ds4_gpu_tensor_free(hidden_row);
+            ds4_gpu_tensor_free(embed_row);
+            ds4_gpu_tensor_free(enorm_row);
+        }
+        /* The trunk's final norm over the whole group, then hnorm into the
+         * second half of the eh_proj input. */
+        if (ok && !postnorm_rows) {
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(norm,
+                                                     hidden,
+                                                     model->map,
+                                                     model->size,
+                                                     weights->output_norm->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     rows,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        for (uint32_t r = 0; ok && r < rows; r++) {
+            ds4_gpu_tensor *hnorm_row = ds4_gpu_tensor_view(
+                    concat, (uint64_t)r * 2ull * embd_bytes + embd_bytes,
+                    embd_bytes);
+            /* hc_rows: the group's own hnorm output row.  postnorm_rows: an
+             * already-normed trunk hidden, one row per caller row. */
+            ds4_gpu_tensor *src_row = postnorm_rows ?
+                ds4_gpu_tensor_view(postnorm_rows,
+                                    (uint64_t)(first + r) * embd_bytes,
+                                    embd_bytes) :
+                ds4_gpu_tensor_view(norm, (uint64_t)r * embd_bytes, embd_bytes);
+            if (!hnorm_row || !src_row) {
+                ok = false;
+            }
+            if (ok) {
+                ok = ds4_gpu_rms_norm_weight_tensor(hnorm_row,
+                                                    src_row,
+                                                    model->map,
+                                                    model->size,
+                                                    l->nextn_hnorm->abs_offset,
+                                                    DS4_N_EMBD,
+                                                    DS4_RMS_EPS) != 0;
+            }
+            ds4_gpu_tensor_free(src_row);
+            ds4_gpu_tensor_free(hnorm_row);
+        }
+        if (ok) {
+            ok = glm53_graph_matmul_rows(x, model, l->nextn_eh_proj,
+                                         2u * DS4_N_EMBD, DS4_N_EMBD, concat,
+                                         rows);
+        }
+        if (ok) {
+            ok = ds4_gpu_rms_norm_weight_rows_tensor(attn_norm,
+                                                     x,
+                                                     model->map,
+                                                     model->size,
+                                                     l->attn_norm->abs_offset,
+                                                     DS4_N_EMBD,
+                                                     rows,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = glm53_graph_matmul_rows(kv_raw, model, l->attn_kv_a_mqa,
+                                         DS4_N_EMBD, kv_raw_dim, attn_norm,
+                                         rows);
+        }
+        if (ok) {
+            ok = ds4_gpu_glm_kv_lora_rms_norm_tensor(kv_norm,
+                                                     kv_raw,
+                                                     model->map,
+                                                     model->size,
+                                                     l->attn_kv_a_norm->abs_offset,
+                                                     rows,
+                                                     kv_raw_dim,
+                                                     DS4_N_KV_LORA,
+                                                     DS4_RMS_EPS) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_glm_store_compact_kv_tensor(g->mtp_kv_lora_cache,
+                                                     g->mtp_k_rope_cache,
+                                                     kv_norm,
+                                                     kv_raw,
+                                                     pos,
+                                                     rows,
+                                                     cache_cap,
+                                                     kv_raw_dim,
+                                                     DS4_N_KV_LORA,
+                                                     DS4_N_ROT,
+                                                     glm_graph_compact_cache_is_f16()) != 0;
+        }
+        if (ok) {
+            ok = glm53_graph_matmul_rows(idx_k, model, l->indexer_attn_k,
+                                         DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM,
+                                         attn_norm, rows);
+        }
+        if (ok) {
+            ok = glm53_graph_matmul_rows(idx_gate, model,
+                                         l->indexer_compressor_gate,
+                                         DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM,
+                                         attn_norm, rows);
+        }
+        if (ok) {
+            ok = ds4_gpu_glm53_indexer_pool_update_tensor(
+                    g->mtp_indexer_key_cache,
+                    g->mtp_indexer_tail_k,
+                    g->mtp_indexer_tail_gate,
+                    idx_k,
+                    idx_gate,
+                    model->map,
+                    model->size,
+                    l->indexer_k_norm->abs_offset,
+                    l->indexer_k_norm_b->abs_offset,
+                    l->indexer_compressor_ape->abs_offset,
+                    pos,
+                    rows,
+                    cache_cap,
+                    DS4_N_INDEXER_HEAD_DIM,
+                    DS4_GLM53_INDEX_POOL_SIZE,
+                    1.0e-6f,
+                    glm_graph_compact_cache_is_f16()) != 0;
+        }
+        ds4_gpu_tensor_free(idx_gate);
+        ds4_gpu_tensor_free(idx_k);
+        ds4_gpu_tensor_free(kv_norm);
+        ds4_gpu_tensor_free(kv_raw);
+        ds4_gpu_tensor_free(attn_norm);
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(concat);
+        ds4_gpu_tensor_free(norm);
+        ds4_gpu_tensor_free(hidden);
+        ds4_gpu_tensor_free(embed);
+        ds4_gpu_tensor_free(ids);
+    }
+    return ok;
+}
+
+/* Park the post-norm trunk hidden (mHC mean through output_norm) of one row in
+ * the seam slot.  slot_unwritten tells whether that row's nextn cache slot has
+ * never been written: a prefill range leaves its last row as a hole, a decode
+ * row has already written it with the token the drafter predicted. */
+static bool glm53_graph_mtp_seam_store(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        ds4_gpu_tensor    *hc_row,
+        uint32_t           pos,
+        bool               slot_unwritten) {
+    if (!g || !g->glm53 || !model || !weights || !weights->output_norm ||
+        !hc_row || !g->mtp_seam_hidden || !g->hc_output || !g->hc_mean_weights) {
+        return false;
+    }
+    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->hc_output,
+                                             hc_row,
+                                             g->hc_mean_weights,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+    if (ok) {
+        ok = ds4_gpu_rms_norm_weight_tensor(g->mtp_seam_hidden,
+                                            g->hc_output,
+                                            model->map,
+                                            model->size,
+                                            weights->output_norm->abs_offset,
+                                            DS4_N_EMBD,
+                                            DS4_RMS_EPS) != 0;
+    }
+    if (ok) {
+        g->mtp_seam_pos = pos;
+        g->mtp_seam_valid = true;
+        g->mtp_seam_unwritten = slot_unwritten;
+    }
+    return ok;
+}
+
+/* Consume the caller's nextn cache requests for the rows this prefill call has
+ * just encoded, inside the command batch that is still open: the pending seam
+ * flush (the previous range's last position, whose next token is now known),
+ * then the requested rows of this range, then the new seam.  A failure never
+ * fails the request and never changes the trunk output, like a failed
+ * glm_graph_mtp_step(). */
+static void glm53_graph_mtp_note_prefill(
+        ds4_glm_gpu_graph *g,
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        ds4_gpu_tensor    *hc_rows,
+        uint32_t           pos0,
+        uint32_t           n_rows) {
+    const uint32_t fill = g->mtp_fill_asked;
+    const int *next = g->mtp_fill_next;
+    const int32_t flush_token = g->mtp_seam_flush;
+    const bool save = g->mtp_seam_save;
+    const uint32_t flush_pos = g->mtp_seam_pos;
+    const bool flush_valid = g->mtp_seam_valid;
+    glm53_graph_mtp_clear_requests(g);
+    if (flush_token >= 0) {
+        if (!flush_valid) return;
+        if (glm53_graph_mtp_fill_rows(g, model, weights, &flush_token,
+                                      g->mtp_seam_token, NULL,
+                                      g->mtp_seam_hidden, flush_pos, 1u)) {
+            g->mtp_seam_unwritten = false;
+        } else {
+            fprintf(stderr,
+                    "ds4: glm mtp: seam flush at position %u failed\n",
+                    flush_pos);
+        }
+        /* The seam is consumed.  A resumed request both flushes the previous
+         * range and fills its own new rows, so the fill and the new seam
+         * still run after the flush. */
+        g->mtp_seam_pos = pos0 + n_rows;
+        g->mtp_seam_valid = false;
+        g->mtp_seam_unwritten = false;
+    }
+    if (fill != 0 && next) {
+        if (!glm53_graph_mtp_fill_rows(g, model, weights, next,
+                                       g->mtp_fill_tokens, hc_rows, NULL,
+                                       pos0, fill)) {
+            fprintf(stderr,
+                    "ds4: glm mtp: prefill fill at position %u x%u failed\n",
+                    pos0, fill);
+        }
+    }
+    if (save && n_rows != 0 && hc_rows) {
+        /* Full mHC row, as above. */
+        ds4_gpu_tensor *last = glm_graph_tensor_row_view_strided(
+                hc_rows, n_rows - 1u,
+                DS4_N_HC * DS4_N_EMBD, DS4_N_HC * DS4_N_EMBD);
+        if (!glm53_graph_mtp_seam_store(g, model, weights, last,
+                                        pos0 + n_rows - 1u, true)) {
+            fprintf(stderr,
+                    "ds4: glm mtp: seam save at position %u failed\n",
+                    pos0 + n_rows - 1u);
+        }
+        ds4_gpu_tensor_free(last);
+    }
 }
 
 
@@ -55674,6 +56357,15 @@ glm53_indexed_attention_done:
     ds4_gpu_tp_set_attn_head_split(0);
 #undef DS4_GLM_PROFILE_INDEXED_STAGE
     if (!metal_graph_stream_prepare_join_all(&layer_prepare_slot, 1)) ok = false;
+    if (ok && !g->ssd_streaming &&
+        (g->mtp_fill_asked != 0 || g->mtp_seam_flush >= 0 || g->mtp_seam_save)) {
+        /* GLM-5.3 nextn cache fill: every mHC row this chunk produced exists
+         * now and the chunk's command batch is still open, so the attention-
+         * free nextn prefix for the requested rows and the seam go into the
+         * same batch.  Never fails the chunk. */
+        glm53_graph_mtp_note_prefill(g, model, weights, hc_cur, pos0, n_tokens);
+        ok = true;
+    }
     if (ok && !g->ssd_streaming) {
         const double trace_end_t0 = trace ? now_sec() : 0.0;
         if (trace) {
@@ -57305,6 +57997,14 @@ glm53_attention_done:
             if (ok) ok = glm_graph_end_commands_if_active();
             else (void)ds4_gpu_synchronize();
         }
+    }
+    if (ok && !g->ssd_streaming && !defer_completion &&
+        (g->mtp_fill_asked != 0 || g->mtp_seam_flush >= 0 || g->mtp_seam_save)) {
+        /* GLM-5.3 nextn cache fill for this decode-style row: g->hc_cur holds
+         * the row's mHC and the command batch is still open.  Never fails the
+         * token. */
+        glm53_graph_mtp_note_prefill(g, model, weights, g->hc_cur, pos, 1u);
+        ok = true;
     }
     if (!g->ssd_streaming && !defer_completion) {
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -62018,10 +62718,15 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
 
 #ifndef DS4_NO_GPU
 /* A new request starts generating on this session.  Whatever draft the
- * previous request left over was conditioned on history the new request
- * extends, and the appended prompt tokens never wrote the nextn cache, so the
- * draft window start is dropped: it is re-decided at this request's first
- * plain MTP step (see ds4_session_glm_note_mtp_window_start). */
+ * previous request left over was conditioned on history the new request only
+ * extends, so it is dropped, and with it the draft window start: ticket 004
+ * made prefill write the nextn caches for the appended prompt rows too, so the
+ * window start is no longer "the first row the drafter itself wrote" but
+ * "the first position this request generated", and that is only known at the
+ * request's first plain MTP step (see ds4_session_glm_note_mtp_window_start).
+ * The seam is deliberately *not* touched here: a resumed request still owns
+ * the previous request's last position and rewrites it with the real first
+ * prompt token. */
 static void ds4_session_glm_new_request(ds4_session *s) {
     if (!s) return;
     s->glm_mtp_have = 0;
@@ -62044,6 +62749,20 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     s->glm_dense_cache_len = 0;
     ds4_session_glm_new_request(s);
     s->glm_mtp_rollback_valid = false;
+}
+
+/* GLM-5.3 nextn (MTP) seam: the trunk post-norm hidden of the last position
+ * whose next token was not known yet.  The nextn KV/indexer caches are kept
+ * hole-free over [0..checkpoint.len-1] by writing that slot as soon as the
+ * next token exists, so every path that moves or rewrites the checkpoint
+ * without writing the matching nextn slot has to drop the seam: the saved
+ * hidden would otherwise describe a position the checkpoint no longer has. */
+static void ds4_session_glm_mtp_seam_invalidate(ds4_session *s) {
+    if (!s) return;
+    s->glm_graph.mtp_seam_valid = false;
+    s->glm_graph.mtp_seam_unwritten = false;
+    s->glm_graph.mtp_seam_pos = 0;
+    glm53_graph_mtp_clear_requests(&s->glm_graph);
 }
 
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
@@ -62716,6 +63435,9 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
             s->checkpoint_valid = true;
             s->mtp_draft_valid = false;
             s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
+            /* The shard carries no nextn caches and no seam hidden, so the
+             * restored checkpoint starts with no seam (ticket 004). */
+            ds4_session_glm_mtp_seam_invalidate(s);
         }
         free(n_comp);
         free(n_index_comp);
@@ -64251,6 +64973,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         s->glm_dense_cache_len = g->full_kv_cache ? saved_full_live : 0;
+        /* The .kv payload has no seam hidden field yet, so a restored session
+         * has no seam: the one position that waited for its next token stays
+         * unwritten until the payload grows that field. */
+        ds4_session_glm_mtp_seam_invalidate(s);
         return 0;
 #endif
     }
@@ -74415,6 +75141,16 @@ static bool glm53_fast_spec_supported(const ds4_session *s) {
            getenv("DS4_GLM_MTP_LEGACY") == NULL;
 }
 
+/* Sessions whose GLM-5.3 nextn (MTP) caches are maintained at all: prefill
+ * fills them and decode writes the nextn indexer only where the fast cycle
+ * runs, so every other configuration (TP, layer slices, ssd streaming, multi
+ * tier, the legacy cycle, dense prefill) keeps the behaviour it had before. */
+static bool ds4_session_glm_mtp_cache_enabled(const ds4_session *s) {
+    return s && s->glm_graph.glm53 &&
+           ds4_engine_glm_mtp_spec_enabled(s->engine) &&
+           glm53_fast_spec_supported(s);
+}
+
 /* GLM-5.3 MTP cycle in the Qwen3.8 design (ds4_session_qwen4_spec_cycle):
  * verify [first_token, draft] -- plus a chained second draft when the depth
  * policy engages it -- in one 2- or 3-row pass that returns every row's logits
@@ -74446,6 +75182,16 @@ static int ds4_session_glm53_fast_spec_cycle(
         s->checkpoint_valid = false;
         return -1;
     }
+    g->mtp_indexer_store = 1;
+    /* The prompt's last row has no nextn cache entry yet: vLLM feeds the
+     * drafter (token[p+1], hidden[p]) and first_token is the token at position
+     * pos, so the seam slot pos-1 can be filled now.  Queue it before the
+     * plain eval or the verify pass, both of which overwrite g->hc_cur; the
+     * first forward call encodes it into a command batch that is open anyway. */
+    if (g->mtp_seam_valid && g->mtp_seam_unwritten &&
+        g->mtp_seam_pos + 1u == pos) {
+        g->mtp_seam_flush = first_token;
+    }
     int depth = exact_sampling ? 2 : glm53_spec_depth(s);
     if (depth == 3 && !glm53_graph_mtp_ensure_row1(g)) depth = 2;
     s->glm_mtp_rollback_valid = false;
@@ -74459,8 +75205,12 @@ static int ds4_session_glm53_fast_spec_cycle(
         (g->compact_cache_cap != 0 && pos + 1u >= g->compact_cache_cap)) {
         /* Plain step, then seed the drafts from g->hc_cur. */
         s->glm_spec_inside = 1;
+        /* This row becomes the request's last position, so keep its post-norm
+         * hidden as the seam; glm_graph_forward_token() stores it. */
+        g->mtp_seam_save = true;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
+        glm53_graph_mtp_clear_requests(g);
         if (rc != 0) return -1;
         const int n1 = glm_session_logits_argmax(s->logits);
         ds4_session_glm_note_mtp_window_start(s, pos);
@@ -74604,6 +75354,9 @@ static int ds4_session_glm53_fast_spec_cycle(
                 accepted[1] = replacement;
                 const int next = glm_session_logits_argmax(s->logits);
                 int nd = -1;
+                /* The replayed replacement row is the request's last
+                 * position; glm_graph_mtp_step() keeps its seam. */
+                g->mtp_seam_save = true;
                 if (replacement != eos_token &&
                     glm_graph_mtp_step(g, m, w, next, pos + 1u, s->glm_mtp_min_pos, &nd)) {
                     s->glm_mtp_draft = nd;
@@ -74625,6 +75378,9 @@ static int ds4_session_glm53_fast_spec_cycle(
     }
     if (mtp_n != 0) {
         int nd = -1;
+        /* The last catch-up row is the request's last position: keep its
+         * post-norm hidden as the seam; glm53_graph_mtp_rows() stores it. */
+        g->mtp_seam_save = true;
         if (glm53_graph_mtp_rows(g, m, w, mtp_tokens, s->glm53_verify_hc, mtp_n,
                                  pos, s->glm_mtp_min_pos, &nd)) {
             s->glm_mtp_draft = nd;
@@ -74639,6 +75395,8 @@ static int ds4_session_glm53_fast_spec_cycle(
             }
         }
     }
+    /* Drop a seam request the catch-up did not reach. */
+    glm53_graph_mtp_clear_requests(g);
     if (timing) {
         const double t2 = now_sec();
         char *dt = ds4_token_text(e, d, NULL);
@@ -76624,9 +77382,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             start = s->checkpoint.len;
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
-            /* A resumed checkpoint is still a new request: the prompt tokens
-             * appended below have no nextn KV, so the draft window must not
-             * reach back to the previous request's start. */
+            /* A resumed checkpoint is still a new request: the draft window
+             * must not reach back to the previous request's start. */
             ds4_session_glm_new_request(s);
         } else {
             s->checkpoint.len = 0;
@@ -76636,6 +77393,46 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (!ds4_session_glm_reset_kda_state(s)) {
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
+            }
+        }
+
+        /* GLM-5.3 nextn (MTP) cache fill for this sync: with MTP on and the
+         * fast cycle supported, the prefill rows below also write the nextn
+         * KV and indexer caches so those caches stay dense over the whole
+         * context instead of only the drafted window. */
+        bool glm53_mtp_fill = false;
+        if (s->glm_graph.glm53) {
+            ds4_glm_gpu_graph *mg = &s->glm_graph;
+            if (ds4_session_glm_mtp_cache_enabled(s) && s->sync_image_count == 0) {
+                /* The caches have to exist before the first prefill row writes
+                 * into them; failing to build them must not fail the request. */
+                if (mg->mtp_ready || glm_graph_mtp_ensure(mg)) {
+                    mg->mtp_indexer_store = 1;
+                    glm53_mtp_fill = true;
+                    /* The previous request's last position gets its real next
+                     * token here: the first new prompt token.  That slot may
+                     * already hold the token the drafter predicted while
+                     * decoding; it is rewritten with the actual token. */
+                    if (resumed_checkpoint && prompt->len == start) {
+                        /* Nothing to append: the checkpoint keeps its length
+                         * and its last position, so the seam still describes
+                         * it and survives untouched. */
+                    } else if (resumed_checkpoint && prompt->len > start &&
+                               mg->mtp_seam_valid &&
+                               mg->mtp_seam_pos + 1u == (uint32_t)start) {
+                        mg->mtp_seam_flush = prompt->v[start];
+                    } else {
+                        ds4_session_glm_mtp_seam_invalidate(s);
+                    }
+                } else {
+                    fprintf(stderr, "ds4: glm mtp: prefill fill disabled\n");
+                    ds4_session_glm_mtp_seam_invalidate(s);
+                }
+            } else {
+                /* MTP off, an unsupported configuration, or image embeddings:
+                 * this sync writes no nextn cache, so the seam is dead. */
+                ds4_session_glm_mtp_seam_invalidate(s);
+                mg->mtp_indexer_store = 0;
             }
         }
 
@@ -76655,6 +77452,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     snprintf(err, errlen, "interrupted");
                     s->checkpoint_valid = s->checkpoint.len > 0;
                     s->mtp_draft_valid = false;
+                    ds4_session_glm_mtp_seam_invalidate(s);
                     ds4_session_glm_cap_dense_cache(s);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
@@ -76685,6 +77483,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 }
                 float *chunk_logits = i + (int)chunk == prompt->len ?
                     s->logits : NULL;
+                const bool last_chunk = i + (int)chunk == prompt->len;
+                if (glm53_mtp_fill) {
+                    /* Row p of this range is fed (token[p+1], trunk hidden[p]).
+                     * The very last row of the whole range has no known next
+                     * token yet, so it is left out and parked as the seam;
+                     * intermediate chunk boundaries are filled, because their
+                     * next token is the first token of the next chunk and this
+                     * loop already holds it. */
+                    ds4_glm_gpu_graph *mg = &s->glm_graph;
+                    const uint32_t fill_rows =
+                        last_chunk && chunk > 0 ? chunk - 1u : chunk;
+                    mg->mtp_fill_asked = fill_rows;
+                    mg->mtp_fill_next = fill_rows != 0 ? prompt->v + i + 1 : NULL;
+                    mg->mtp_seam_save = last_chunk;
+                }
                 const bool ok = short_resume ?
                     glm_graph_forward_token(&s->glm_graph,
                                             &e->model,
@@ -76746,8 +77559,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                              backend_name, i);
                     s->checkpoint_valid = false;
                     s->mtp_draft_valid = false;
+                    ds4_session_glm_mtp_seam_invalidate(s);
                     ds4_session_glm_cap_dense_cache(s);
                     return 1;
+                }
+                if (glm53_mtp_fill) {
+                    /* The forward call consumed the requests if it got that
+                     * far; drop whatever is left so it cannot land on a later
+                     * call. */
+                    glm53_graph_mtp_clear_requests(&s->glm_graph);
                 }
                 for (uint32_t j = 0; j < chunk; j++) {
                     token_vec_push(&s->checkpoint, prompt->v[i + (int)j]);
@@ -78477,6 +79297,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!s->glm_spec_inside) {
             s->glm_mtp_rollback_valid = false;
             s->glm_mtp_have = 0;
+            /* Plain decode appends a token without writing any nextn cache
+             * slot, so the seam's position is no longer the checkpoint's last
+             * position: drop it (ticket 004). */
+            ds4_session_glm_mtp_seam_invalidate(s);
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
         const bool updates_dense =
@@ -80686,6 +81510,9 @@ static int ds4_sessions_eval_batch_native(
         token_vec_push(&s->checkpoint, items[i].token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        /* The batched decode row writes no nextn cache slot, so the seam no
+         * longer describes the checkpoint's last position (ticket 004). */
+        if (ds4_session_is_glm(s)) ds4_session_glm_mtp_seam_invalidate(s);
         if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
         if (!ds4_session_is_glm(s) && !native_ds41) {
             ds4_session_dspark_capture_note_checkpoint(s);
@@ -80962,6 +81789,8 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
         token_vec_push(&s->checkpoint, items[i].token);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        /* Mixed batch decode writes no nextn cache slot: drop the seam. */
+        if (ds4_session_is_glm(s)) ds4_session_glm_mtp_seam_invalidate(s);
         ds4_session_dspark_capture_note_checkpoint(s);
     }
     if (getenv("DS4_METAL_SESSION_BATCH_LOG") != NULL) {
@@ -86270,6 +87099,8 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    /* A dropped checkpoint has no last position for the seam to describe. */
+    ds4_session_glm_mtp_seam_invalidate(s);
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
@@ -86333,6 +87164,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
+    /* The checkpoint got shorter without a nextn write for the dropped rows,
+     * so the seam no longer describes the last position. */
+    ds4_session_glm_mtp_seam_invalidate(s);
     if (s->glm_mtp_min_pos_valid && (uint32_t)pos < s->glm_mtp_min_pos) {
         /* Nothing left of the draft window: re-decide it at the next plain
          * step instead of leaving min_pos above the running position. */
@@ -86361,6 +87195,207 @@ bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out)
     return false;
 #endif
 }
+
+#ifndef DS4_NO_GPU
+/* GLM-5.3 nextn (MTP) cache test hooks (ticket 004).  The seam itself is only
+ * maintained by the production paths -- ds4_session_sync() and the fast
+ * speculative cycle -- and these hooks open no new production entry point: they
+ * materialise the caches so a test can zero them, read single rows back, and
+ * run the very plain MTP step production runs after a decode. */
+static ds4_glm_gpu_graph *ds4_test_glm_mtp_graph(ds4_session *s) {
+    if (!s || !s->glm_graph_ready || !s->glm_graph.glm53) return NULL;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!g->mtp_ready && !glm_graph_mtp_ensure(g)) return NULL;
+    if (!g->mtp_kv_lora_cache || !g->mtp_indexer_key_cache ||
+        !g->mtp_indexer_tail_k) {
+        return NULL;
+    }
+    return g;
+}
+
+/* One row of a compact (f16 or f32) cache as plain floats. */
+static bool ds4_test_glm_read_compact_row(const ds4_gpu_tensor *cache,
+                                          uint64_t row, uint32_t dim,
+                                          float *out, uint32_t cap) {
+    if (!cache || !out || dim == 0 || cap < dim) return false;
+    const uint64_t elem = glm_graph_compact_cache_elem_bytes();
+    const uint64_t row_bytes = (uint64_t)dim * elem;
+    if (row_bytes == 0 || row > ds4_gpu_tensor_bytes(cache) / row_bytes ||
+        row_bytes > ds4_gpu_tensor_bytes(cache) - row * row_bytes) {
+        return false;
+    }
+    if (elem == sizeof(float)) {
+        return ds4_gpu_tensor_read(cache, row * row_bytes, out, row_bytes) != 0;
+    }
+    uint16_t *bits = malloc((size_t)dim * sizeof(uint16_t));
+    if (!bits) return false;
+    const bool ok = ds4_gpu_tensor_read(cache, row * row_bytes, bits,
+                                        row_bytes) != 0;
+    for (uint32_t i = 0; ok && i < dim; i++) out[i] = f16_to_f32(bits[i]);
+    free(bits);
+    return ok;
+}
+
+static bool ds4_test_glm_zero_compact_row(ds4_gpu_tensor *cache,
+                                          uint64_t row, uint32_t dim) {
+    if (!cache || dim == 0) return false;
+    const uint64_t elem = glm_graph_compact_cache_elem_bytes();
+    const uint64_t row_bytes = (uint64_t)dim * elem;
+    if (row_bytes == 0 || row > ds4_gpu_tensor_bytes(cache) / row_bytes ||
+        row_bytes > ds4_gpu_tensor_bytes(cache) - row * row_bytes) {
+        return false;
+    }
+    unsigned char *zero = calloc(1, (size_t)row_bytes);
+    if (!zero) return false;
+    const bool ok = ds4_gpu_tensor_write(cache, row * row_bytes, zero,
+                                         row_bytes) != 0;
+    free(zero);
+    return ok;
+}
+
+void ds4_test_glm_zero_mtp_caches(ds4_session *s) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return;
+    const uint64_t kv_bytes = ds4_gpu_tensor_bytes(g->mtp_kv_lora_cache);
+    const uint64_t pool_bytes = ds4_gpu_tensor_bytes(g->mtp_indexer_key_cache);
+    unsigned char *zero = calloc(1, (size_t)(kv_bytes > pool_bytes ?
+                                             kv_bytes : pool_bytes));
+    if (!zero) return;
+    const uint64_t tail_values =
+        ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) / sizeof(float);
+    const bool ok =
+        kv_bytes == 0 ||
+        ds4_gpu_tensor_write(g->mtp_kv_lora_cache, 0, zero, kv_bytes) != 0;
+    const bool ok_pool =
+        pool_bytes == 0 ||
+        ds4_gpu_tensor_write(g->mtp_indexer_key_cache, 0, zero, pool_bytes) != 0;
+    /* The K tail handle owns the whole contiguous K+gate allocation, so one
+     * fill of it resets both halves. */
+    const bool ok_tail =
+        tail_values == 0 ||
+        ds4_gpu_tensor_fill_f32(g->mtp_indexer_tail_k, 0.0f,
+                                tail_values) != 0;
+    free(zero);
+    if (!ok || !ok_pool || !ok_tail) {
+        fprintf(stderr, "ds4-test: glm mtp cache zero failed\n");
+    }
+}
+
+int ds4_test_glm_mtp_cache_dims(ds4_session *s, uint32_t *kv_dim,
+                                uint32_t *pool_dim, uint32_t *pool_size,
+                                uint32_t *tail_values, uint32_t *cache_cap) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return 0;
+    if (kv_dim) *kv_dim = DS4_N_KV_LORA;
+    if (pool_dim) *pool_dim = DS4_N_INDEXER_HEAD_DIM;
+    if (pool_size) *pool_size = DS4_GLM53_INDEX_POOL_SIZE;
+    if (tail_values) {
+        *tail_values = (uint32_t)(ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) /
+                                  sizeof(float));
+    }
+    if (cache_cap) *cache_cap = glm_graph_mtp_cache_cap(g);
+    return 1;
+}
+
+bool ds4_test_glm_read_mtp_kv(ds4_session *s, uint32_t pos,
+                              float *kv, uint32_t kv_cap,
+                              float *pool, uint32_t pool_cap,
+                              float *tail, uint32_t tail_cap) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return false;
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    if (pos >= cache_cap) return false;
+    if (kv && !ds4_test_glm_read_compact_row(g->mtp_kv_lora_cache, pos,
+                                             DS4_N_KV_LORA, kv, kv_cap)) {
+        return false;
+    }
+    if (pool) {
+        const uint64_t pool_row = pos / DS4_GLM53_INDEX_POOL_SIZE;
+        if (!ds4_test_glm_read_compact_row(g->mtp_indexer_key_cache, pool_row,
+                                           DS4_N_INDEXER_HEAD_DIM, pool,
+                                           pool_cap)) {
+            return false;
+        }
+    }
+    if (tail) {
+        /* The K tail owns one contiguous K+gate allocation, so the whole raw
+         * window reads back as POOL key rows followed by POOL gate rows. */
+        const uint64_t values =
+            ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) / sizeof(float);
+        if (values == 0 || tail_cap < (uint32_t)values ||
+            ds4_gpu_tensor_read(g->mtp_indexer_tail_k, 0, tail,
+                                values * sizeof(float)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ds4_test_glm_zero_kv_slot(ds4_session *s, uint32_t pos) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g) return false;
+    /* Only the compact KV row: the pooled indexer key and the raw tail are
+     * pool-level state a single slot does not own. */
+    return pos < glm_graph_mtp_cache_cap(g) &&
+           ds4_test_glm_zero_compact_row(g->mtp_kv_lora_cache, pos,
+                                         DS4_N_KV_LORA);
+}
+
+int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
+                                        uint32_t start,
+                                        int *draft, float *draft_logits,
+                                        uint32_t draft_logits_cap) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !s->engine || s->checkpoint.len <= 0) return 0;
+    const uint32_t pos = (uint32_t)s->checkpoint.len - 1u;
+    if (pos < start || pos >= glm_graph_mtp_cache_cap(g)) return 0;
+    if (draft_logits && draft_logits_cap < DS4_N_VOCAB) return 0;
+    /* The row this session just decoded is the step's trunk hidden, exactly as
+     * in the fast cycle's plain step, and the step writes the nextn indexer
+     * like every decode row does. */
+    g->mtp_indexer_store = 1;
+    int drafted = -1;
+    if (!glm_graph_mtp_step(g, &s->engine->model, &s->engine->weights,
+                            token, pos, start, &drafted)) {
+        return 0;
+    }
+    if (draft) *draft = drafted;
+    if (draft_logits) {
+        memcpy(draft_logits, g->mtp_logits_host,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    return 1;
+}
+#else  /* DS4_NO_GPU: every GLM-5.3 nextn cache hook is a no-op. */
+void ds4_test_glm_zero_mtp_caches(ds4_session *s) { (void)s; }
+int ds4_test_glm_mtp_cache_dims(ds4_session *s, uint32_t *kv_dim,
+                                uint32_t *pool_dim, uint32_t *pool_size,
+                                uint32_t *tail_values, uint32_t *cache_cap) {
+    (void)s; (void)kv_dim; (void)pool_dim; (void)pool_size;
+    (void)tail_values; (void)cache_cap;
+    return 0;
+}
+bool ds4_test_glm_read_mtp_kv(ds4_session *s, uint32_t pos,
+                              float *kv, uint32_t kv_cap,
+                              float *pool, uint32_t pool_cap,
+                              float *tail, uint32_t tail_cap) {
+    (void)s; (void)pos; (void)kv; (void)kv_cap;
+    (void)pool; (void)pool_cap; (void)tail; (void)tail_cap;
+    return false;
+}
+bool ds4_test_glm_zero_kv_slot(ds4_session *s, uint32_t pos) {
+    (void)s; (void)pos;
+    return false;
+}
+int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
+                                        uint32_t start,
+                                        int *draft, float *draft_logits,
+                                        uint32_t draft_logits_cap) {
+    (void)s; (void)token; (void)start;
+    (void)draft; (void)draft_logits; (void)draft_logits_cap;
+    return 0;
+}
+#endif
 
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
     ds4_session *s = xcalloc(1, sizeof(*s));

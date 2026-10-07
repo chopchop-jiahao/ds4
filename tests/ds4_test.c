@@ -7965,6 +7965,697 @@ cleanup:
     ds4_session_free(live);
 }
 
+/* GLM 5.3 nextn (MTP) cache prefill write (ticket 004).  With MTP on, prompt
+ * prefill also writes the nextn KV and pooled indexer caches, so those caches
+ * are dense over the whole context instead of only the drafted window, and the
+ * one position whose next token does not exist yet is parked in the seam and
+ * written the moment it does.  The test builds the same caches twice -- once
+ * from prefill, once one decode row at a time -- compares them, then checks
+ * the seam on both sides (the first generated token and a continued request)
+ * and the position-0 embedding mask.  Needs a GLM 5.3 model and
+ * DS4_TEST_GLM_MTP=1. */
+#define TEST_GLM_MTP_PREFILL_CHUNK 2048u  /* ds4.c:39102 DS4_GLM53_PREFILL_CHUNK_TOKENS */
+#define TEST_GLM_MTP_PREFILL_POOL 4u      /* ds4.c:39098 DS4_GLM53_INDEX_POOL_SIZE */
+#define TEST_GLM_MTP_PREFILL_SUFFIX 2u    /* longest continued-request suffix */
+
+typedef struct {
+    int chunk_events;
+    int intermediate;
+} test_glm_mtp_prefill_progress;
+
+static void test_glm_mtp_prefill_progress_cb(void *ud, const char *event,
+                                             int current, int total) {
+    test_glm_mtp_prefill_progress *p = ud;
+    if (strcmp(event, "prefill_chunk") != 0) return;
+    p->chunk_events++;
+    if (current > 0 && current < total) p->intermediate++;
+}
+
+static bool test_glm_mtp_row_finite(const float *v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (!isfinite(v[i])) return false;
+    }
+    return true;
+}
+
+static bool test_glm_mtp_row_zero(const float *v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (v[i] != 0.0f) return false;
+    }
+    return true;
+}
+
+static bool test_glm_mtp_row_written(const float *v, uint32_t n) {
+    bool any = false;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!isfinite(v[i])) return false;
+        if (v[i] != 0.0f) any = true;
+    }
+    return any;
+}
+
+static void test_glm_mtp_row_diff(const float *a, const float *b, uint32_t n,
+                                  float *max_abs, float *max_rel) {
+    *max_abs = 0.0f;
+    *max_rel = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        const float d = fabsf(a[i] - b[i]);
+        const float m = fabsf(a[i]) > fabsf(b[i]) ? fabsf(a[i]) : fabsf(b[i]);
+        if (d > *max_abs) *max_abs = d;
+        if (m > 1.0e-6f) {
+            const float r = d / m;
+            if (r > *max_rel) *max_rel = r;
+        }
+    }
+}
+
+/* Greedy top-k of a raw logits row, for the draft-logit comparison. */
+static void test_glm_mtp_top_k(const float *logits, int vocab, int k,
+                               ds4_token_score *out) {
+    for (int i = 0; i < k; i++) {
+        out[i].id = -1;
+        out[i].logit = -1.0e30f;   /* -FLT_MAX: -ffast-math makes -INFINITY UB */
+    }
+    for (int t = 0; t < vocab; t++) {
+        if (logits[t] <= out[k - 1].logit) continue;
+        int j = k - 1;
+        while (j > 0 && logits[t] > out[j - 1].logit) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j].id = t;
+        out[j].logit = logits[t];
+    }
+}
+
+/* P: the chat-formatted prompt, repeated until it is longer than one whole
+ * prefill chunk plus a pool window, then trimmed from the tail until its
+ * length is a whole number of pools.  That makes the seam row the last cell of
+ * its pool, so the seam has to complete a pooled key row. */
+static bool test_glm_mtp_prefill_prompt(ds4_engine *engine, ds4_tokens *prompt,
+                                        const char *base) {
+    const uint32_t need = TEST_GLM_MTP_PREFILL_CHUNK + TEST_GLM_MTP_PREFILL_POOL;
+    const size_t base_len = strlen(base);
+    size_t text_len = base_len;
+    char *text = malloc(base_len + 1);
+    if (!text) return false;
+    memcpy(text, base, base_len + 1);
+    for (;;) {
+        prompt->len = 0;
+        ds4_chat_begin(engine, prompt);
+        ds4_chat_append_message(engine, prompt, "user", text);
+        ds4_chat_append_assistant_prefix(engine, prompt, DS4_THINK_NONE);
+        if ((uint32_t)prompt->len >= need) break;
+        if (text_len > ((size_t)1 << 26)) {
+            free(text);
+            return false;
+        }
+        char *grown = realloc(text, text_len * 2 + 1);
+        if (!grown) {
+            free(text);
+            return false;
+        }
+        text = grown;
+        memcpy(text + text_len, base, base_len);
+        text_len += base_len;
+        text[text_len] = '\0';
+    }
+    free(text);
+    while (prompt->len > 0 &&
+           (uint32_t)prompt->len % TEST_GLM_MTP_PREFILL_POOL != 0u) {
+        prompt->len--;
+    }
+    return (uint32_t)prompt->len > TEST_GLM_MTP_PREFILL_CHUNK;
+}
+
+/* The buffers every section compares through. */
+typedef struct {
+    uint32_t kv_dim, pool_dim, pool_size, tail_dim, cache_cap, vocab;
+    float *kv_a, *kv_b, *pool_a, *pool_b, *tail_a, *tail_b;
+} test_glm_mtp_caches;
+
+/* Continued request (section 2): a request that resumes from a checkpoint
+ * whose last nextn slot was written with the drafter's predicted token refills
+ * that slot with the actual token, and the refilled row must sit closer to the
+ * row a cold prefill of the same prompt writes than the predicted one did. */
+static void test_glm_mtp_prefill_resume(ds4_engine *engine,
+                                        const ds4_tokens *prompt, uint32_t m,
+                                        int ctx, bool pinned_prompt,
+                                        test_glm_mtp_caches *c) {
+    int *gen = calloc((size_t)TEST_GLM_MTP_WINDOW_MIN_TOKENS, sizeof(int));
+    TEST_ASSERT(gen != NULL);
+    if (!gen) return;
+
+    for (uint32_t suffix_len = 1u; suffix_len <= TEST_GLM_MTP_PREFILL_SUFFIX;
+         suffix_len++) {
+        ds4_session *r = NULL;
+        ds4_session *r2 = NULL;
+        ds4_tokens prompt2 = {0};
+        char err[256] = {0};
+        bool ok = ds4_session_create(&r, engine, ctx) == 0;
+        TEST_ASSERT(ok);
+        if (!ok) break;
+        ds4_test_glm_zero_mtp_caches(r);
+        ok = ds4_session_sync(r, prompt, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+        if (!ok) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill resume sync failed: %s\n",
+                    err);
+            ds4_session_free(r);
+            break;
+        }
+
+        int chunk = 0, single = 0;
+        const int n = test_glm_mtp_window_generate(
+            engine, r, TEST_GLM_MTP_WINDOW_MIN_TOKENS, gen, &chunk, &single);
+        const uint32_t l = (uint32_t)ds4_session_pos(r);
+        fprintf(stderr,
+                "ds4-test: glm-mtp-prefill resume S=%u generated=%d L=%u M=%u "
+                "L%%POOL=%u\n", suffix_len, n, l, m, l % c->pool_size);
+        if (n < TEST_GLM_MTP_WINDOW_MIN_TOKENS || l != m + (uint32_t)n) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill resume checkpoint mismatch: "
+                            "L=%u M=%u n=%d\n", l, m, n);
+            TEST_ASSERT(n >= TEST_GLM_MTP_WINDOW_MIN_TOKENS);
+            TEST_ASSERT(l == m + (uint32_t)n);
+            ds4_session_free(r);
+            break;
+        }
+
+        ds4_token_score top[8] = {0};
+        TEST_ASSERT(ds4_session_top_logprobs(r, top, 8) == 8);
+        const int x0 = top[1].id;
+        TEST_ASSERT(x0 != top[0].id);
+
+        const ds4_tokens *history = ds4_session_tokens(r);
+        for (uint32_t i = 0; i < l; i++) ds4_tokens_push(&prompt2, history->v[i]);
+        ds4_tokens_push(&prompt2, x0);
+        if (suffix_len > 1u) ds4_tokens_push(&prompt2, prompt->v[1]);
+        TEST_ASSERT((uint32_t)prompt2.len == l + suffix_len);
+
+        /* Slot L-1 holds the drafter's guess.  Blanking only its KV row means
+         * a real write is the only thing that can make it non-zero again. */
+        ok = ds4_test_glm_read_mtp_kv(r, l - 1u, c->kv_a, c->kv_dim, NULL, 0,
+                                      NULL, 0);
+        TEST_ASSERT(ok && test_glm_mtp_row_written(c->kv_a, c->kv_dim));
+        const float *row_pre = c->kv_a;
+        float *row_pre_copy = malloc((size_t)c->kv_dim * sizeof(float));
+        float *row_post_copy = malloc((size_t)c->kv_dim * sizeof(float));
+        float *row_ref_copy = malloc((size_t)c->kv_dim * sizeof(float));
+        TEST_ASSERT(row_pre_copy && row_post_copy && row_ref_copy);
+        if (!row_pre_copy || !row_post_copy || !row_ref_copy) {
+            free(row_pre_copy); free(row_post_copy); free(row_ref_copy);
+            ds4_tokens_free(&prompt2);
+            ds4_session_free(r);
+            break;
+        }
+        memcpy(row_pre_copy, row_pre, (size_t)c->kv_dim * sizeof(float));
+        TEST_ASSERT(ds4_test_glm_zero_kv_slot(r, l - 1u));
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(r, l - 1u, c->kv_a, c->kv_dim,
+                                             NULL, 0, NULL, 0));
+        TEST_ASSERT(test_glm_mtp_row_zero(c->kv_a, c->kv_dim));
+
+        ok = ds4_session_sync(r, &prompt2, err, sizeof(err)) == 0;
+        TEST_ASSERT(ok);
+        if (!ok) fprintf(stderr, "ds4-test: glm-mtp-prefill resume failed: %s\n", err);
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(r, l - 1u, row_post_copy, c->kv_dim,
+                                             NULL, 0, NULL, 0));
+        fprintf(stderr, "ds4-test: glm-mtp-prefill resume S=%u slot %u refilled=%d\n",
+                suffix_len, l - 1u,
+                test_glm_mtp_row_written(row_post_copy, c->kv_dim));
+        TEST_ASSERT(test_glm_mtp_row_written(row_post_copy, c->kv_dim));
+
+        ok = ds4_session_create(&r2, engine, ctx) == 0;
+        TEST_ASSERT(ok);
+        if (ok) {
+            ds4_test_glm_zero_mtp_caches(r2);
+            ok = ds4_session_sync(r2, &prompt2, err, sizeof(err)) == 0;
+            TEST_ASSERT(ok);
+            if (ok) {
+                TEST_ASSERT(ds4_test_glm_read_mtp_kv(r2, l - 1u, row_ref_copy,
+                                                     c->kv_dim, NULL, 0, NULL, 0));
+                float post_abs = 0.0f, post_rel = 0.0f;
+                float pre_abs = 0.0f, pre_rel = 0.0f;
+                test_glm_mtp_row_diff(row_post_copy, row_ref_copy, c->kv_dim,
+                                      &post_abs, &post_rel);
+                test_glm_mtp_row_diff(row_pre_copy, row_ref_copy, c->kv_dim,
+                                      &pre_abs, &pre_rel);
+                fprintf(stderr,
+                        "ds4-test: glm-mtp-prefill resume S=%u slot %u vs cold "
+                        "prefill: refilled max_abs=%.6g max_rel=%.6g, predicted "
+                        "max_abs=%.6g max_rel=%.6g\n",
+                        suffix_len, l - 1u, post_abs, post_rel, pre_abs, pre_rel);
+                /* Ordering, not a numeric threshold: the row written with the
+                 * real token must be closer to the cold row than the one
+                 * written with the drafter's guess was. */
+                TEST_ASSERT(post_abs < pre_abs);
+
+                float before_abs = 0.0f, before_rel = 0.0f;
+                float after_abs = 0.0f, after_rel = 0.0f;
+                for (uint32_t row = 0;; row++) {
+                    const uint32_t slot = row * c->pool_size;
+                    if (slot >= (uint32_t)prompt2.len) break;
+                    if (!ds4_test_glm_read_mtp_kv(r, slot, NULL, 0, c->pool_a,
+                                                  c->pool_dim, NULL, 0)) break;
+                    if (!ds4_test_glm_read_mtp_kv(r2, slot, NULL, 0, c->pool_b,
+                                                  c->pool_dim, NULL, 0)) break;
+                    float ab = 0.0f, rl = 0.0f;
+                    test_glm_mtp_row_diff(c->pool_a, c->pool_b, c->pool_dim,
+                                          &ab, &rl);
+                    /* "before" = every position of this pooled row predates the
+                     * refilled seam slot, so both sessions must agree exactly. */
+                    if (slot + c->pool_size - 1u < l - 1u) {
+                        if (ab > before_abs) before_abs = ab;
+                        if (rl > before_rel) before_rel = rl;
+                    } else {
+                        if (ab > after_abs) after_abs = ab;
+                        if (rl > after_rel) after_rel = rl;
+                    }
+                }
+                TEST_ASSERT(ds4_test_glm_read_mtp_kv(r, 0u, NULL, 0, NULL, 0,
+                                                     c->tail_a, c->tail_dim));
+                TEST_ASSERT(ds4_test_glm_read_mtp_kv(r2, 0u, NULL, 0, NULL, 0,
+                                                     c->tail_b, c->tail_dim));
+                float tab = 0.0f, trl = 0.0f;
+                test_glm_mtp_row_diff(c->tail_a, c->tail_b, c->tail_dim, &tab, &trl);
+                fprintf(stderr,
+                        "ds4-test: glm-mtp-prefill resume S=%u pooled rows before "
+                        "%u: max_abs=%.6g max_rel=%.6g; from %u: max_abs=%.6g "
+                        "max_rel=%.6g; tail: max_abs=%.6g max_rel=%.6g\n",
+                        suffix_len, l - 1u, before_abs, before_rel, l - 1u,
+                        after_abs, after_rel, tab, trl);
+                TEST_ASSERT(test_glm_mtp_row_finite(c->tail_a, c->tail_dim));
+                TEST_ASSERT(test_glm_mtp_row_finite(c->tail_b, c->tail_dim));
+                /* These two pooled-row groups are the only place where every
+                 * nextn-cache producer shows up: prefill (its embedding offset
+                 * and its post-norm hidden), the plain step's indexer write,
+                 * the catch-up's indexer write and the seam rewrite.  The
+                 * thresholds below sit between the correct value and the wrong
+                 * ones; measured on GLM-5.3-Flash-IQ2-Down10Q2K-imatrix.gguf
+                 * with the default prompt (DS4_TEST_GLM_MTP_PROMPT unset), and
+                 * identical for S = 1 and S = 2.  With a user prompt the
+                 * numbers move, so the groups stay print-only there.
+                 *   before: correct 0.0551758; bug: prefill embedding off by
+                 *     one 0.454041, hidden not through output_norm 1.21045,
+                 *     plain step without the indexer 0.537598, catch-up
+                 *     without the indexer 2.14258, seam never flushed 1.86914
+                 *   from: correct 0.0292969; bug: prefill embedding off by one
+                 *     0.48996, hidden not through output_norm 0.880493, seam
+                 *     flushed with the predicted token 0.414551, seam hidden
+                 *     never updated after decode 1.43103, catch-up without the
+                 *     indexer 1.68787 */
+                if (!pinned_prompt) {
+                    TEST_ASSERT(before_abs <= 0.15f);
+                    TEST_ASSERT(after_abs <= 0.1f);
+                }
+            }
+        }
+        ds4_session_free(r2);
+        ds4_session_free(r);
+        ds4_tokens_free(&prompt2);
+        free(row_pre_copy);
+        free(row_post_copy);
+        free(row_ref_copy);
+    }
+    free(gen);
+}
+
+static void test_glm_mtp_prefill_write(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill skipped (needs a GLM 5.3 model "
+                        "and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+
+    const char *prompt_path = getenv("DS4_TEST_GLM_MTP_PROMPT");
+    char *file_text = prompt_path && prompt_path[0] ? test_read_file(prompt_path) : NULL;
+    if (prompt_path && prompt_path[0] && !file_text) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill cannot read %s\n", prompt_path);
+        TEST_ASSERT(false);
+        return;
+    }
+
+    ds4_tokens prompt = {0};
+    ds4_tokens extended = {0};
+    test_glm_mtp_caches c = {0};
+    ds4_session *a = NULL;
+    ds4_session *b = NULL;
+    float *tail_pre = NULL, *draft_a = NULL, *draft_b = NULL;
+    char err[256] = {0};
+    bool ok = test_glm_mtp_prefill_prompt(engine, &prompt,
+                                          file_text ? file_text
+                                                    : test_mtp_copy_prompt());
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill could not build a prompt longer "
+                        "than one prefill chunk and a whole number of pools\n");
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    const uint32_t m = (uint32_t)prompt.len;
+    const int eos = ds4_token_eos(engine);
+    /* ds4_session_sync requires prompt->len < ctx, so the ctx is the longest
+     * token sequence this test builds plus one: P + G + the longest suffix. */
+    int ctx = (int)m + TEST_GLM_MTP_WINDOW_MIN_TOKENS +
+              (int)TEST_GLM_MTP_PREFILL_SUFFIX + 1;
+    if (ctx < (int)m + 2) ctx = (int)m + 2;
+    fprintf(stderr, "ds4-test: glm-mtp-prefill prompt=%u ctx=%d\n", m, ctx);
+
+    /* ---- 1. prefill fills the caches; the seam waits for its token ---- */
+    ok = ds4_session_create(&a, engine, ctx) == 0;
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill ds4_session_create(ctx=%d) "
+                        "refused\n", ctx);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    /* The nextn caches are built lazily, so zeroing them here is what puts
+     * zeros in place before the first prefill row can write anything. */
+    ds4_test_glm_zero_mtp_caches(a);
+    TEST_ASSERT(ds4_test_glm_mtp_cache_dims(a, &c.kv_dim, &c.pool_dim,
+                                            &c.pool_size, &c.tail_dim,
+                                            &c.cache_cap));
+    TEST_ASSERT(c.pool_size == TEST_GLM_MTP_PREFILL_POOL);
+    TEST_ASSERT(m < c.cache_cap);
+    c.vocab = (uint32_t)ds4_engine_vocab_size(engine);
+    c.kv_a = malloc((size_t)c.kv_dim * sizeof(float));
+    c.kv_b = malloc((size_t)c.kv_dim * sizeof(float));
+    c.pool_a = malloc((size_t)c.pool_dim * sizeof(float));
+    c.pool_b = malloc((size_t)c.pool_dim * sizeof(float));
+    c.tail_a = malloc((size_t)c.tail_dim * sizeof(float));
+    c.tail_b = malloc((size_t)c.tail_dim * sizeof(float));
+    tail_pre = malloc((size_t)c.tail_dim * sizeof(float));
+    draft_a = malloc((size_t)c.vocab * sizeof(float));
+    draft_b = malloc((size_t)c.vocab * sizeof(float));
+    TEST_ASSERT(c.kv_a && c.kv_b && c.pool_a && c.pool_b && c.tail_a &&
+                c.tail_b && tail_pre && draft_a && draft_b);
+    if (!c.kv_a || !c.kv_b || !c.pool_a || !c.pool_b || !c.tail_a ||
+        !c.tail_b || !tail_pre || !draft_a || !draft_b) goto cleanup;
+
+    test_glm_mtp_prefill_progress progress = {0};
+    ds4_session_set_progress(a, test_glm_mtp_prefill_progress_cb, &progress);
+    ok = ds4_session_sync(a, &prompt, err, sizeof(err)) == 0;
+    ds4_session_set_progress(a, NULL, NULL);
+    TEST_ASSERT(ok);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill sync failed: %s\n", err);
+        goto cleanup;
+    }
+    /* An intermediate chunk boundary is what proves the fill ran across more
+     * than one chunk of the same prompt. */
+    fprintf(stderr, "ds4-test: glm-mtp-prefill chunk events=%d intermediate=%d\n",
+            progress.chunk_events, progress.intermediate);
+    TEST_ASSERT(progress.chunk_events > 0);
+    TEST_ASSERT(progress.intermediate > 0);
+
+    /* Every row the prefill could write is dense and finite. */
+    for (uint32_t p = 0; p + 1u < m; p++) {
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, p, c.kv_a, c.kv_dim, NULL, 0,
+                                             NULL, 0));
+        if (!test_glm_mtp_row_written(c.kv_a, c.kv_dim)) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill KV slot %u unwritten\n", p);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+    }
+    /* The last row had no next token, so its slot is still the zero the caches
+     * started with. */
+    TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m - 1u, c.kv_a, c.kv_dim, c.pool_a,
+                                         c.pool_dim, c.tail_a, c.tail_dim));
+    fprintf(stderr, "ds4-test: glm-mtp-prefill seam slot %u all zero=%d\n",
+            m - 1u, test_glm_mtp_row_zero(c.kv_a, c.kv_dim));
+    TEST_ASSERT(test_glm_mtp_row_zero(c.kv_a, c.kv_dim));
+    memcpy(tail_pre, c.tail_a, (size_t)c.tail_dim * sizeof(float));
+
+    const uint32_t seam_pool = m / c.pool_size;   /* M is pool-aligned */
+    for (uint32_t row = 0; row + 1u < seam_pool; row++) {
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, row * c.pool_size, NULL, 0,
+                                             c.pool_a, c.pool_dim, NULL, 0));
+        if (!test_glm_mtp_row_written(c.pool_a, c.pool_dim)) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill pool row %u unwritten\n", row);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+    }
+    /* The seam's own pool row needs the row the seam is waiting to write. */
+    TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m - 1u, NULL, 0, c.pool_a,
+                                         c.pool_dim, NULL, 0));
+    fprintf(stderr, "ds4-test: glm-mtp-prefill seam pool row %u all zero=%d\n",
+            seam_pool - 1u, test_glm_mtp_row_zero(c.pool_a, c.pool_dim));
+    TEST_ASSERT(test_glm_mtp_row_zero(c.pool_a, c.pool_dim));
+    /* The raw tail is the other half of the same story: the prefill could not
+     * finish the seam's pool, so it parked the rows it did have in the cells
+     * below the seam's own cell. */
+    {
+        const uint32_t stride = c.tail_dim / 2u;   /* k half, then gate half */
+        for (uint32_t cell = 0; cell + 1u < c.pool_size; cell++) {
+            const float *k = c.tail_a + (uint64_t)cell * c.pool_dim;
+            const float *gate = c.tail_a + stride + (uint64_t)cell * c.pool_dim;
+            if (!test_glm_mtp_row_written(k, c.pool_dim) ||
+                !test_glm_mtp_row_written(gate, c.pool_dim)) {
+                fprintf(stderr, "ds4-test: glm-mtp-prefill tail cell %u unwritten\n",
+                        cell);
+                TEST_ASSERT(false);
+                goto cleanup;
+            }
+        }
+    }
+
+    /* The first generated token: no draft is pending, so the real speculative
+     * entry point takes the plain step and the production seam flush runs. */
+    const int t = ds4_session_argmax(a);
+    TEST_ASSERT(t >= 0);
+    int accepted[4] = {0};
+    const int ntok = ds4_session_eval_speculative_argmax(
+        a, t, TEST_GLM_MTP_WINDOW_MIN_TOKENS, eos, accepted, 4, err, sizeof(err));
+    fprintf(stderr, "ds4-test: glm-mtp-prefill first cycle committed=%d pos=%d\n",
+            ntok, ds4_session_pos(a));
+    TEST_ASSERT(ntok == 1);
+    TEST_ASSERT((uint32_t)ds4_session_pos(a) == m + 1u);
+    if (ntok != 1) goto cleanup;
+    TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m - 1u, c.kv_a, c.kv_dim, c.pool_a,
+                                         c.pool_dim, c.tail_a, c.tail_dim));
+    fprintf(stderr, "ds4-test: glm-mtp-prefill after the first token: seam slot %u "
+                    "written=%d seam pool row %u written=%d\n",
+            m - 1u, test_glm_mtp_row_written(c.kv_a, c.kv_dim), seam_pool - 1u,
+            test_glm_mtp_row_written(c.pool_a, c.pool_dim));
+    TEST_ASSERT(test_glm_mtp_row_written(c.kv_a, c.kv_dim));
+    TEST_ASSERT(test_glm_mtp_row_written(c.pool_a, c.pool_dim));
+    /* The plain step also wrote the row it just decoded. */
+    TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m, c.kv_a, c.kv_dim, NULL, 0, NULL, 0));
+    TEST_ASSERT(test_glm_mtp_row_written(c.kv_a, c.kv_dim));
+    /* A row that completes its pool never rewrites the raw tail: the pool
+     * kernel keeps only the window it could not finish.  The seam's cell is
+     * therefore the cell the prefill could NOT write, and it still reads as
+     * prefill left it; the seam's effect shows up in the pooled row above. */
+    {
+        const uint32_t stride = c.tail_dim / 2u;
+        const uint32_t cell = (m - 1u) % c.pool_size;
+        float k_abs = 0.0f, k_rel = 0.0f, g_abs = 0.0f, g_rel = 0.0f;
+        test_glm_mtp_row_diff(c.tail_a + (uint64_t)cell * c.pool_dim,
+                              tail_pre + (uint64_t)cell * c.pool_dim,
+                              c.pool_dim, &k_abs, &k_rel);
+        test_glm_mtp_row_diff(c.tail_a + stride + (uint64_t)cell * c.pool_dim,
+                              tail_pre + stride + (uint64_t)cell * c.pool_dim,
+                              c.pool_dim, &g_abs, &g_rel);
+        fprintf(stderr, "ds4-test: glm-mtp-prefill seam tail cell %u: k max_abs=%.6g "
+                        "max_rel=%.6g gate max_abs=%.6g max_rel=%.6g (a "
+                        "pool-completing row leaves the tail alone)\n",
+                cell, k_abs, k_rel, g_abs, g_rel);
+        TEST_ASSERT(k_abs == 0.0f && g_abs == 0.0f);
+    }
+
+    /* ---- 2. the same caches, built one decode row at a time ---- */
+    ok = ds4_session_create(&b, engine, ctx) == 0;
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-prefill ds4_session_create(ctx=%d) "
+                        "refused for the decode session\n", ctx);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    ds4_test_glm_zero_mtp_caches(b);
+    ds4_tokens head = prompt;   /* shares P's buffer; never freed on its own */
+    head.len = 1;
+    TEST_ASSERT(ds4_session_sync(b, &head, err, sizeof(err)) == 0);
+    /* q = 0 has no decode hidden to write, so slot 0 is section 3's job. */
+    for (uint32_t q = 1u; q < m; q++) {
+        head.len = (int)q + 1;
+        ok = ds4_session_sync(b, &head, err, sizeof(err)) == 0;
+        if (!ok) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill decode resume at %u: %s\n",
+                    q, err);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+        const int next = q + 1u < m ? prompt.v[q + 1u] : t;
+        if (!ds4_test_glm_mtp_draft_after_decode(b, next, q, NULL, NULL, 0)) {
+            fprintf(stderr, "ds4-test: glm-mtp-prefill decode step at %u failed\n", q);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+    }
+
+    /* One more step on both sides: the draft logits must agree. */
+    for (uint32_t i = 0; i < m; i++) ds4_tokens_push(&extended, prompt.v[i]);
+    ds4_tokens_push(&extended, t);
+    TEST_ASSERT(ds4_session_sync(b, &extended, err, sizeof(err)) == 0);
+    const int next_a = ds4_session_argmax(a);
+    TEST_ASSERT(next_a >= 0);
+    TEST_ASSERT(ds4_test_glm_mtp_draft_after_decode(a, next_a, 1u, NULL,
+                                                    draft_a, c.vocab));
+    TEST_ASSERT(ds4_test_glm_mtp_draft_after_decode(b, next_a, 1u, NULL,
+                                                    draft_b, c.vocab));
+    {
+        ds4_token_score top_a[8], top_b[8];
+        test_glm_mtp_top_k(draft_a, (int)c.vocab, 8, top_a);
+        test_glm_mtp_top_k(draft_b, (int)c.vocab, 8, top_b);
+        float worst = 0.0f;
+        int same_rank = 0;
+        for (int i = 0; i < 8; i++) {
+            if (top_a[i].id != top_b[i].id) continue;
+            same_rank++;
+            const float d = fabsf(top_a[i].logit - top_b[i].logit);
+            if (d > worst) worst = d;
+        }
+        fprintf(stderr, "ds4-test: glm-mtp-prefill draft top1=%d/%d same-rank "
+                        "top8=%d max same-rank delta=%.6g\n",
+                top_a[0].id, top_b[0].id, same_rank, worst);
+        TEST_ASSERT(top_a[0].id == top_b[0].id);
+        TEST_ASSERT(test_top_tokens_overlap(top_a, top_b, 8));
+    }
+
+    /* Cache comparison against the decode-built session.  No numeric threshold
+     * this round: the reviewer measures the real values first. */
+    {
+        float worst_abs = 0.0f, worst_rel = 0.0f;
+        for (uint32_t p = 1u; p + 1u < m; p++) {
+            TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, p, c.kv_a, c.kv_dim, NULL, 0,
+                                                 NULL, 0));
+            TEST_ASSERT(ds4_test_glm_read_mtp_kv(b, p, c.kv_b, c.kv_dim, NULL, 0,
+                                                 NULL, 0));
+            float ab = 0.0f, rl = 0.0f;
+            test_glm_mtp_row_diff(c.kv_a, c.kv_b, c.kv_dim, &ab, &rl);
+            if (ab > worst_abs) worst_abs = ab;
+            if (rl > worst_rel) worst_rel = rl;
+        }
+        fprintf(stderr, "ds4-test: glm-mtp-prefill K1 prefill-vs-decode slots [1,%u]: "
+                        "max_abs=%.6g max_rel=%.6g\n", m - 2u, worst_abs, worst_rel);
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_a, c.kv_dim));
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_b, c.kv_dim));
+
+        float k2a = 0.0f, k2r = 0.0f, k3a = 0.0f, k3r = 0.0f;
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m - 1u, c.kv_a, c.kv_dim, NULL, 0,
+                                             NULL, 0));
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(b, m - 1u, c.kv_b, c.kv_dim, NULL, 0,
+                                             NULL, 0));
+        test_glm_mtp_row_diff(c.kv_a, c.kv_b, c.kv_dim, &k2a, &k2r);
+        fprintf(stderr, "ds4-test: glm-mtp-prefill K2 seam slot %u: max_abs=%.6g "
+                        "max_rel=%.6g\n", m - 1u, k2a, k2r);
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_a, c.kv_dim));
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_b, c.kv_dim));
+
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, m, c.kv_a, c.kv_dim, NULL, 0,
+                                             NULL, 0));
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(b, m, c.kv_b, c.kv_dim, NULL, 0,
+                                             NULL, 0));
+        test_glm_mtp_row_diff(c.kv_a, c.kv_b, c.kv_dim, &k3a, &k3r);
+        fprintf(stderr, "ds4-test: glm-mtp-prefill K3 plain-step slot %u: "
+                        "max_abs=%.6g max_rel=%.6g\n", m, k3a, k3r);
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_a, c.kv_dim));
+        TEST_ASSERT(test_glm_mtp_row_finite(c.kv_b, c.kv_dim));
+
+        worst_abs = 0.0f; worst_rel = 0.0f;
+        for (uint32_t row = 1u; row <= m / c.pool_size; row++) {
+            TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, row * c.pool_size, NULL, 0,
+                                                 c.pool_a, c.pool_dim, NULL, 0));
+            TEST_ASSERT(ds4_test_glm_read_mtp_kv(b, row * c.pool_size, NULL, 0,
+                                                 c.pool_b, c.pool_dim, NULL, 0));
+            float ab = 0.0f, rl = 0.0f;
+            test_glm_mtp_row_diff(c.pool_a, c.pool_b, c.pool_dim, &ab, &rl);
+            if (ab > worst_abs) worst_abs = ab;
+            if (rl > worst_rel) worst_rel = rl;
+        }
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(a, 0u, NULL, 0, NULL, 0, c.tail_a,
+                                             c.tail_dim));
+        TEST_ASSERT(ds4_test_glm_read_mtp_kv(b, 0u, NULL, 0, NULL, 0, c.tail_b,
+                                             c.tail_dim));
+        float tab = 0.0f, trl = 0.0f;
+        test_glm_mtp_row_diff(c.tail_a, c.tail_b, c.tail_dim, &tab, &trl);
+        fprintf(stderr, "ds4-test: glm-mtp-prefill P pooled rows [1,%u]: max_abs=%.6g "
+                        "max_rel=%.6g; tail: max_abs=%.6g max_rel=%.6g\n",
+                m / c.pool_size, worst_abs, worst_rel, tab, trl);
+        TEST_ASSERT(test_glm_mtp_row_finite(c.tail_a, c.tail_dim));
+        TEST_ASSERT(test_glm_mtp_row_finite(c.tail_b, c.tail_dim));
+    }
+
+    /* ---- 3. a continued request fills the seam it resumes from ---- */
+    test_glm_mtp_prefill_resume(engine, &prompt, m, ctx,
+                                file_text != NULL, &c);
+
+    /* ---- 4. position 0 masks the embedding half of the eh_proj input ---- */
+    {
+        int x = -1, y = -1;
+        for (int i = 1; i < prompt.len && y < 0; i++) {
+            if (x < 0) x = prompt.v[i];
+            else if (prompt.v[i] != x) y = prompt.v[i];
+        }
+        TEST_ASSERT(x >= 0 && y >= 0);
+        if (x >= 0 && y >= 0) {
+            ds4_session *s1 = NULL;
+            ds4_session *s2 = NULL;
+            ds4_tokens p1 = {0}, p2 = {0};
+            ds4_tokens_push(&p1, prompt.v[0]);
+            ds4_tokens_push(&p1, x);
+            ds4_tokens_push(&p2, prompt.v[0]);
+            ds4_tokens_push(&p2, y);
+            if (ds4_session_create(&s1, engine, ctx) == 0 &&
+                ds4_session_create(&s2, engine, ctx) == 0) {
+                ds4_test_glm_zero_mtp_caches(s1);
+                ds4_test_glm_zero_mtp_caches(s2);
+                TEST_ASSERT(ds4_session_sync(s1, &p1, err, sizeof(err)) == 0);
+                TEST_ASSERT(ds4_session_sync(s2, &p2, err, sizeof(err)) == 0);
+                TEST_ASSERT(ds4_test_glm_read_mtp_kv(s1, 0u, c.kv_a, c.kv_dim,
+                                                     NULL, 0, NULL, 0));
+                TEST_ASSERT(ds4_test_glm_read_mtp_kv(s2, 0u, c.kv_b, c.kv_dim,
+                                                     NULL, 0, NULL, 0));
+                const bool same = memcmp(c.kv_a, c.kv_b,
+                                         (size_t)c.kv_dim * sizeof(float)) == 0;
+                float ab = 0.0f, rl = 0.0f;
+                test_glm_mtp_row_diff(c.kv_a, c.kv_b, c.kv_dim, &ab, &rl);
+                fprintf(stderr, "ds4-test: glm-mtp-prefill position 0 slot "
+                                "bit-identical=%d max_abs=%.6g (second token %d "
+                                "vs %d)\n", same, ab, x, y);
+                /* Slot 0 sees only the BOS hidden and a zeroed embedding, so
+                 * the second token must not reach it at all. */
+                TEST_ASSERT(same);
+            } else {
+                fprintf(stderr, "ds4-test: glm-mtp-prefill position 0 sessions "
+                                "could not be created\n");
+                TEST_ASSERT(false);
+            }
+            ds4_session_free(s2);
+            ds4_session_free(s1);
+            ds4_tokens_free(&p2);
+            ds4_tokens_free(&p1);
+        }
+    }
+
+cleanup:
+    free(draft_b);
+    free(draft_a);
+    free(tail_pre);
+    free(c.tail_b);
+    free(c.tail_a);
+    free(c.pool_b);
+    free(c.pool_a);
+    free(c.kv_b);
+    free(c.kv_a);
+    ds4_session_free(b);
+    ds4_session_free(a);
+    ds4_tokens_free(&extended);
+    ds4_tokens_free(&prompt);
+    free(file_text);
+}
+
 /* Same invariant as the MTP depth smoke, but for the DSpark support model.  This
  * is separate from the fixture because it teacher-forces every committed token
  * through normal decode and directly checks that DSpark never commits a token
@@ -8062,6 +8753,7 @@ static const ds4_test_entry test_entries[] = {
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
     {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP drafts from the current request's first generated position after a resume or a disk-KV restore", test_glm_mtp_request_window},
+    {"--glm-mtp-prefill", "glm-mtp-prefill", "GLM 5.3 MTP prefill writes the nextn KV and indexer caches, and the seam fills the row that waits for its token", test_glm_mtp_prefill_write},
     {"--dspark-verify-depth", "dspark-verify-depth", "DSpark speculative verify commits autoregressive-identical tokens at draft depth > 2", test_dspark_verify_depth},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
@@ -8094,7 +8786,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_SNAPSHOT_PROMPT=FILE  Prompt for the session snapshot round trip.");
     puts("  DS4_TEST_SNAPSHOT_CTX=N        Context for the session snapshot round trip.");
     puts("  DS4_TEST_GLM_MTP=1             Include embedded GLM MTP in snapshot verification.");
-    puts("  DS4_TEST_GLM_MTP_PROMPT=FILE   User prompt for --glm-mtp-verify.");
+    puts("  DS4_TEST_GLM_MTP_PROMPT=FILE   User prompt for --glm-mtp-verify; for --glm-mtp-prefill it is repeated past one prefill chunk when unset.");
     puts("  DS4_TEST_GLM_MTP_TOKENS=N      Tokens to generate in --glm-mtp-verify. Default: 256.");
     puts("  DS4_TEST_GLM_MTP_DUMP=FILE     Write the committed token ids from --glm-mtp-verify.");
     puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Pin the widest commit --glm-mtp-verify expects. Unset: DS4_GLM_MTP_DEPTH=2/3 expects that width, automatic depth only expects 2..3.");

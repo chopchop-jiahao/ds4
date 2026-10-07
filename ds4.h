@@ -487,6 +487,30 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
  * that is generating now.  Returns false while the start is undecided (no
  * plain MTP step has run since the request began); position 0 is a valid start. */
 bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out);
+/* Test helpers (ds4-test): GLM-5.3 nextn (MTP) cache probes.  Zero every nextn
+ * cache of a session (compact KV, pooled indexer key and the raw K/gate tail),
+ * read one absolute slot back (its KV row, the pooled indexer row that covers
+ * it and the whole raw tail window), zero one KV slot alone, and run the same
+ * plain MTP step the fast cycle runs right after a decode (cache slot =
+ * checkpoint.len-1, attention window [start .. checkpoint.len-1]).  All are
+ * no-ops off the GLM-5.3 GPU path; the seam itself is only ever maintained by
+ * the production sync/decode paths. */
+void ds4_test_glm_zero_mtp_caches(ds4_session *s);
+/* Row widths in floats for the buffers above: the KV row, one pooled indexer
+ * row, the pool size, the whole raw tail window and the nextn cache capacity.
+ * Returns 0 when the session has no GLM-5.3 nextn caches. */
+int ds4_test_glm_mtp_cache_dims(ds4_session *s, uint32_t *kv_dim,
+                                uint32_t *pool_dim, uint32_t *pool_size,
+                                uint32_t *tail_values, uint32_t *cache_cap);
+bool ds4_test_glm_read_mtp_kv(ds4_session *s, uint32_t pos,
+                              float *kv, uint32_t kv_cap,
+                              float *pool, uint32_t pool_cap,
+                              float *tail, uint32_t tail_cap);
+bool ds4_test_glm_zero_kv_slot(ds4_session *s, uint32_t pos);
+int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
+                                        uint32_t start, int *draft,
+                                        float *draft_logits,
+                                        uint32_t draft_logits_cap);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
