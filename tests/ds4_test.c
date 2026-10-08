@@ -11206,6 +11206,7 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
      * pass and the catch-up rows it ends with, the chained draft row. */
     const bool sampled = kind == DS4_TEST_GLM_MTP_FAIL_FLUSH;
     const uint32_t floor_before = ds4_test_glm_mtp_read_floor(session);
+    const bool flag_before = ds4_test_glm_mtp_cache_complete(session) != 0;
     int cycle_at_failure = (kind == DS4_TEST_GLM_MTP_FAIL_FILL) ? 0 : -1;
     uint32_t pos_at_failure = 0;
     if (kind == DS4_TEST_GLM_MTP_FAIL_FILL) {
@@ -11259,15 +11260,28 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
             floor_before, ds4_test_glm_mtp_read_floor(session), pos_at_failure);
     TEST_ASSERT(failures == 1);
     TEST_ASSERT(cycle_at_failure >= 0);
-    /* After the injected write failure, the cache-complete flag must be cleared. */
-    TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
     ok = failures == 1 && cycle_at_failure >= 0;
     if (kind == DS4_TEST_GLM_MTP_FAIL_CHAIN) {
         /* A chained draft row is overwritten before anything reads it, so the
-         * floor must not move and the next cycle runs as usual. */
+         * floor must not move and the next cycle runs as usual.  No slot
+         * becomes unreadable, so the caches still describe the whole prefix
+         * and the flag must not change either.  In ds4.c the flag is cleared
+         * only where the floor rises or a rewind loses its seam
+         * (ds4_session_glm_mtp_absorb_writes, _note_token retire, _seam_drop,
+         * _rewind); a chain failure returns early in
+         * glm53_graph_mtp_note_write_failed without setting mtp_write_failed,
+         * so absorb_writes does nothing for it, and this cycle loop never
+         * reaches _rewind (only ds4_session_rewind does) or _seam_drop (sync
+         * and rewind only), nor a floor-moving retire when the floor is
+         * unchanged. */
         TEST_ASSERT(ds4_test_glm_mtp_read_floor(session) == floor_before);
         ok = ok && ds4_test_glm_mtp_read_floor(session) == floor_before;
+        TEST_ASSERT((ds4_test_glm_mtp_cache_complete(session) != 0) == flag_before);
+        ok = ok && (ds4_test_glm_mtp_cache_complete(session) != 0) == flag_before;
     } else {
+        /* After the injected write failure, the cache-complete flag must be cleared. */
+        TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
+        ok = ok && ds4_test_glm_mtp_cache_complete(session) == 0;
         const uint32_t failed_slot = kind == DS4_TEST_GLM_MTP_FAIL_FLUSH
                                      ? (pos_at_failure > 0 ? pos_at_failure - 1u : 0u)
                                      : pos_at_failure;
