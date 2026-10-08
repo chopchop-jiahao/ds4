@@ -63264,6 +63264,13 @@ static int ds4_session_load_glm_mtp_section(ds4_session *s, FILE *fp,
         ds4_session_glm_mtp_note_incomplete(s);
         return 1;
     }
+    /* Validate the seam state from the stored section before using it. */
+    if (sec.seam_pos > sec.rows ||
+        sec.seam_written < -1 || sec.seam_written >= (int32_t)DS4_N_VOCAB) {
+        payload_set_err(err, errlen,
+                        "KV checkpoint GLM MTP seam state is corrupted");
+        return 1;
+    }
     /* The caches and the seam are the writer's, slot for slot and byte for
      * byte, so the seam keeps exactly the state it had: invalid stays invalid
      * and a pending seam rewrite still fills its slot (ticket 006). */
@@ -63271,6 +63278,7 @@ static int ds4_session_load_glm_mtp_section(ds4_session *s, FILE *fp,
     g->mtp_seam_pos = sec.seam_pos;
     g->mtp_seam_written = sec.seam_written;
     g->mtp_seam_valid = (sec.flags & DS4_GLM_MTP_SECTION_FLAG_SEAM) != 0;
+    g->mtp_indexer_store = 1;
     s->glm_mtp_cache_complete = true;
     return 0;
 }
@@ -76194,7 +76202,8 @@ static int ds4_session_glm_spec_cycle_impl(
         pos + 2 > g->ctx_size ||
         (g->compact_cache_cap != 0 && pos + 1 >= g->compact_cache_cap)) {
         /* Plain step, then seed the first draft from g->cur. */
-        if (g->glm53) g->mtp_seam_save = true;
+        /* Ensure nextn caches are allocated before setting seam_save (005, A1). */
+        if (g->glm53 && glm_graph_mtp_ensure(g)) g->mtp_seam_save = true;
         s->glm_spec_inside = 1;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
@@ -76455,6 +76464,8 @@ static int ds4_session_glm_spec_cycle_impl(
                     fprintf(stderr,
                             "ds4: glm mtp: replacement write at pos %u failed\n",
                             pos);
+                    /* Failed slot goes unreadable (005, rule 3). */
+                    glm53_graph_mtp_note_write_failed(g, pos, false);
                 }
                 if (!ds4_session_glm_mtp_seam_save_cur(s, pos + 1u, -1)) {
                     fprintf(stderr,
@@ -76542,20 +76553,22 @@ static int ds4_session_glm_spec_cycle_impl(
  * cycle has not overwritten them yet, the legacy cycle replays the kept row.
  * With keep == 0 the last slot is the one before the block, which the cycle
  * already rewrote with first_token on its way in; its hidden is gone, so a
- * differing next token retires that slot instead of rewriting it. */
-static void ds4_session_glm_mtp_rewind_seam(ds4_session *s, uint32_t start,
+ * differing next token retires that slot instead of rewriting it.
+ *
+ * Return true iff the seam slot will be rewritten from a stored hidden. */
+static bool ds4_session_glm_mtp_rewind_seam(ds4_session *s, uint32_t start,
                                             uint32_t keep, bool fast) {
     ds4_glm_gpu_graph *g = &s->glm_graph;
     glm53_graph_mtp_clear_requests(g);
     if (keep == 0u) {
         if (start == 0u) {
             ds4_session_glm_mtp_seam_invalidate(s);
-            return;
+            return false;
         }
         g->mtp_seam_pos = start - 1u;
         g->mtp_seam_written = s->glm_mtp_rollback_first_token;
         g->mtp_seam_valid = false;
-        return;
+        return false;
     }
     const uint32_t slot = start + keep - 1u;
     const int dropped = (uint32_t)s->checkpoint.len > start + keep ?
@@ -76581,6 +76594,7 @@ static void ds4_session_glm_mtp_rewind_seam(ds4_session *s, uint32_t start,
         g->mtp_seam_written = -1;
         g->mtp_seam_valid = false;
     }
+    return stored;
 }
 
 /* Restore the state immediately before the last two-token GLM-5.3 MTP cycle,
@@ -76597,10 +76611,6 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     ds4_glm_gpu_graph *g = &s->glm_graph;
     /* A rewind is not a place to spend a queued nextn write on. */
     glm53_graph_mtp_clear_requests(g);
-    /* Every rewind drops the tail it truncates, and the slots before it may
-     * carry the tokens the rewind gives up on: a snapshot may no longer claim
-     * the caches describe the kept prefix (ticket 006). */
-    s->glm_mtp_cache_complete = false;
     if (s->glm_mtp_rollback_fast) {
         /* Row snapshots hold the state after row 0 / row 1 of the verify. */
         const uint32_t keep = (uint32_t)pos - start;
@@ -76618,7 +76628,11 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
         }
         s->glm_dense_cache_len = s->glm_mtp_rollback_dense_len;
         if (ok && keep != 0u) ds4_session_glm_note_dense_cache(s, start, keep);
-        if (ok) ds4_session_glm_mtp_rewind_seam(s, start, keep, true);
+        bool seam_stored = false;
+        if (ok) seam_stored = ds4_session_glm_mtp_rewind_seam(s, start, keep, true);
+        /* Only keep the cache-complete flag if the seam was successfully stored
+         * (ticket 006: seam will hold the dropped token and its hidden). */
+        if (!seam_stored) s->glm_mtp_cache_complete = false;
         s->glm_mtp_rollback_valid = false;
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
@@ -76638,10 +76652,14 @@ static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
                                      false);
         if (ok) ds4_session_glm_note_dense_cache(s, start, 1);
     }
+    bool seam_stored = false;
     if (ok) {
-        ds4_session_glm_mtp_rewind_seam(s, start,
-                                        (uint32_t)pos - start, false);
+        seam_stored = ds4_session_glm_mtp_rewind_seam(s, start,
+                                                      (uint32_t)pos - start, false);
     }
+    /* Only keep the cache-complete flag if the seam was successfully stored and
+     * the rewind path succeeded (ticket 006: seam will hold the dropped token). */
+    if (!seam_stored || !ok) s->glm_mtp_cache_complete = false;
     s->glm_mtp_rollback_valid = false;
     s->glm_mtp_have = 0;
     return ok;
@@ -78418,7 +78436,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     s->glm_mtp_cache_complete = true;
                 }
             } else {
-                ds4_session_glm_mtp_note_incomplete(s);
+                /* No nextn fills (image span or disabled): raise floor to
+                 * current length so drafts cannot read unwritten slots (005, B5). */
+                ds4_session_glm_mtp_seam_drop(s);
             }
             glm_debug_dump_prefill_logits(s->logits);
             return 0;
@@ -80148,10 +80168,18 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                 s->glm_graph.mtp_seam_save = true;
                 seam_requests = true;
             } else {
-                /* Plain decode appends a token without writing any nextn cache
-                 * slot, so the seam's position is no longer the checkpoint's
-                 * last position (ticket 004), and the slot it stepped over
-                 * stays unwritten (ticket 006). */
+                /* The legacy cycle first lets the seam rewrite the last slot
+                 * with this token, as the cycle itself does on entry; a
+                 * resample rewind leaves that slot holding the dropped token
+                 * (ticket 005).  Plain decode then appends a token without
+                 * writing any nextn cache slot, so the seam's position is no
+                 * longer the checkpoint's last position (ticket 004), and the
+                 * slot it stepped over stays unwritten (ticket 006). */
+                if (ds4_session_glm_mtp_tracked(s)) {
+                    s->glm_graph.mtp_seam_flush =
+                        ds4_session_glm_mtp_note_token(s, token);
+                    (void)ds4_session_glm_mtp_flush_now(s);
+                }
                 ds4_session_glm_mtp_seam_invalidate(s);
                 ds4_session_glm_mtp_note_incomplete(s);
             }

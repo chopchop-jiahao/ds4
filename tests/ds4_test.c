@@ -1199,6 +1199,69 @@ static int test_glm_mtp_payload_cross_generate(ds4_session *s, int mtp,
     return total;
 }
 
+/* Sidecar `<DS4_TEST_PAYLOAD_FILE>.ref` written by "fail" mode next to the .kv
+ * file.  The "fail" file's history was produced by speculative decode cycles,
+ * and decode and prefill differ numerically, so a cold prefill of that history
+ * is not a valid oracle; the writer session right after it saved is.
+ * Format, all fields native-endian binary, in this order:
+ *   int32   pos                      writer's ds4_session_pos after the save
+ *   8 times (int32 id, float logit)  writer's ds4_session_top_logprobs, k=8
+ *   int32   n                        number of greedy tokens that follow
+ *   n times int32 token              writer continued with plain
+ *                                    ds4_session_eval (argmax each step) via
+ *                                    test_glm_mtp_payload_cross_generate(mtp=0)
+ */
+#define TEST_GLM_MTP_PAYLOAD_REF_TOP 8
+
+typedef struct {
+    int32_t pos;
+    ds4_token_score top[TEST_GLM_MTP_PAYLOAD_REF_TOP];
+    int32_t n;
+    int tokens[TEST_GLM_MTP_PAYLOAD_CYCLES * 2];
+} test_glm_mtp_payload_ref;
+
+static bool test_glm_mtp_payload_ref_write(const char *ref_path,
+                                           const test_glm_mtp_payload_ref *ref) {
+    FILE *f = fopen(ref_path, "wb");
+    if (!f) return false;
+    bool ok = fwrite(&ref->pos, sizeof(ref->pos), 1, f) == 1;
+    for (int i = 0; ok && i < TEST_GLM_MTP_PAYLOAD_REF_TOP; i++) {
+        const int32_t id = ref->top[i].id;
+        ok = fwrite(&id, sizeof(id), 1, f) == 1 &&
+             fwrite(&ref->top[i].logit, sizeof(float), 1, f) == 1;
+    }
+    ok = ok && fwrite(&ref->n, sizeof(ref->n), 1, f) == 1;
+    for (int i = 0; ok && i < ref->n; i++) {
+        const int32_t t = ref->tokens[i];
+        ok = fwrite(&t, sizeof(t), 1, f) == 1;
+    }
+    return fclose(f) == 0 && ok;
+}
+
+/* 1 = read, 0 = no sidecar, -1 = unreadable or malformed. */
+static int test_glm_mtp_payload_ref_read(const char *ref_path,
+                                         test_glm_mtp_payload_ref *ref) {
+    FILE *f = fopen(ref_path, "rb");
+    if (!f) return 0;
+    memset(ref, 0, sizeof(*ref));
+    bool ok = fread(&ref->pos, sizeof(ref->pos), 1, f) == 1;
+    for (int i = 0; ok && i < TEST_GLM_MTP_PAYLOAD_REF_TOP; i++) {
+        int32_t id = 0;
+        ok = fread(&id, sizeof(id), 1, f) == 1 &&
+             fread(&ref->top[i].logit, sizeof(float), 1, f) == 1;
+        ref->top[i].id = id;
+    }
+    ok = ok && fread(&ref->n, sizeof(ref->n), 1, f) == 1 && ref->n > 0 &&
+         ref->n <= (int32_t)(sizeof(ref->tokens) / sizeof(ref->tokens[0]));
+    for (int i = 0; ok && i < ref->n; i++) {
+        int32_t t = 0;
+        ok = fread(&t, sizeof(t), 1, f) == 1;
+        ref->tokens[i] = t;
+    }
+    fclose(f);
+    return ok ? 1 : -1;
+}
+
 static void test_glm_mtp_payload_cross(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine || !ds4_engine_is_glm53(engine)) {
@@ -1220,23 +1283,36 @@ static void test_glm_mtp_payload_cross(void) {
 
     char err[192] = {0};
     ds4_tokens prompt = {0};
+    ds4_tokens restored_hist = {0};
     ds4_session *session = NULL;
     ds4_session *cold = NULL;
     FILE *fp = NULL;
     int restored_tokens[TEST_GLM_MTP_PAYLOAD_CYCLES * 2] = {0};
     int cold_tokens[TEST_GLM_MTP_PAYLOAD_CYCLES * 2] = {0};
+    test_glm_mtp_payload_ref ref;
+    char ref_path[4096];
     const uint32_t ctx = 1024;
     /* Whether this engine maintains the nextn caches at all. */
     int mtp_engine = 0;
 
     test_glm_mtp_payload_cross_build_prompt(engine, &prompt);
     TEST_ASSERT(prompt.len > 0);
+    TEST_ASSERT(snprintf(ref_path, sizeof(ref_path), "%s.ref", path) <
+                (int)sizeof(ref_path));
 
     if (!strcmp(mode, "save")) {
+        /* A save-mode file is a prefill of the prompt, whose reference is a
+         * cold prefill; drop any sidecar a previous "fail" run left here. */
+        remove(ref_path);
         TEST_ASSERT(ds4_session_create(&session, engine, ctx) == 0 && session);
         TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
         mtp_engine = ds4_test_glm_mtp_cache_complete(session);
         const uint64_t expected = ds4_session_payload_bytes(session);
+        /* When MTP is requested, the cache-complete flag must be true before
+         * saving to ensure the payload carries MTP data (ticket 006). */
+        if (mtp_requested) {
+            TEST_ASSERT(mtp_engine != 0);
+        }
         fp = fopen(path, "wb");
         TEST_ASSERT(fp != NULL);
         if (!fp) goto cleanup;
@@ -1258,6 +1334,79 @@ static void test_glm_mtp_payload_cross(void) {
         TEST_ASSERT(expected != 0 && (uint64_t)written == expected);
         goto cleanup;
     }
+    if (!strcmp(mode, "fail")) {
+        /* Test T3: MTP-on session with write failure drops flag to 0. */
+        TEST_ASSERT(ds4_session_create(&session, engine, ctx) == 0 && session);
+        TEST_ASSERT(ds4_session_sync(session, &prompt, err, sizeof(err)) == 0);
+        TEST_ASSERT(mtp_requested);
+        /* Arm the write failure and run cycles until it triggers. */
+        ds4_test_glm_mtp_fail_next(session, DS4_TEST_GLM_MTP_FAIL_ROWS);
+        int failed_attempts = 0;
+        for (int attempt = 0; attempt < 8 && ds4_test_glm_mtp_cache_complete(session) != 0; attempt++) {
+            int first = ds4_session_argmax(session);
+            if (first < 0) break;
+            int accepted[4] = {0};
+            int ntok = ds4_session_eval_speculative_argmax(session, first, 4,
+                                                          ds4_token_eos(engine),
+                                                          accepted, 4, err, sizeof(err));
+            if (ntok < 1) break;
+            failed_attempts++;
+        }
+        TEST_ASSERT(failed_attempts > 0);  /* Ensure we actually ran cycles */
+        /* After failure, flag should be 0. */
+        TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
+        const uint64_t expected = ds4_session_payload_bytes(session);
+        fp = fopen(path, "wb");
+        TEST_ASSERT(fp != NULL);
+        if (!fp) goto cleanup;
+        TEST_ASSERT(ds4_session_save_payload(session, fp, err, sizeof(err)) == 0);
+        fflush(fp);
+        const long written = ftell(fp);
+        fclose(fp);
+        fp = NULL;
+        fprintf(stderr, "ds4-test: glm-mtp-payload-cross fail: bytes=%" PRIu64
+                        " written=%ld\n", expected, written);
+        /* Payload size must match reported size. */
+        TEST_ASSERT(expected != 0 && (uint64_t)written == expected);
+        /* Oracle for the MTP-off "load" run: this writer session as saved,
+         * then continued with plain eval.  The .kv file is already closed. */
+        memset(&ref, 0, sizeof(ref));
+        ref.pos = ds4_session_pos(session);
+        TEST_ASSERT(ds4_session_top_logprobs(session, ref.top,
+                                             TEST_GLM_MTP_PAYLOAD_REF_TOP) ==
+                    TEST_GLM_MTP_PAYLOAD_REF_TOP);
+        ref.n = test_glm_mtp_payload_cross_generate(
+            session, 0, ref.tokens,
+            (int)(sizeof(ref.tokens) / sizeof(ref.tokens[0])),
+            err, sizeof(err));
+        TEST_ASSERT(ref.n > 0);
+        TEST_ASSERT(test_glm_mtp_payload_ref_write(ref_path, &ref));
+        /* Now test loading with MTP-on (must fail/miss for incomplete cache). */
+        fp = fopen(path, "rb");
+        TEST_ASSERT(fp != NULL);
+        if (!fp) goto cleanup;
+        TEST_ASSERT(fseek(fp, 0, SEEK_END) == 0);
+        const long size = ftell(fp);
+        TEST_ASSERT(size > 0);
+        rewind(fp);
+        ds4_session *mtp_on_load = NULL;
+        TEST_ASSERT(ds4_session_create(&mtp_on_load, engine, ctx) == 0 && mtp_on_load);
+        int load_rc = ds4_session_load_payload(mtp_on_load, fp, (uint64_t)size,
+                                               err, sizeof(err));
+        /* MTP-on load of incomplete cache file must fail (miss). */
+        if (load_rc == 0) {
+            fprintf(stderr, "ds4-test: glm-mtp-payload-cross fail: ERROR - MTP-on load "
+                    "succeeded but should have failed\n");
+            TEST_ASSERT(false);
+        } else {
+            fprintf(stderr, "ds4-test: glm-mtp-payload-cross fail: MTP-on load failed as "
+                    "expected (miss)\n");
+        }
+        ds4_session_free(mtp_on_load);
+        fclose(fp);
+        fp = NULL;
+        goto cleanup;
+    }
     if (strcmp(mode, "load")) {
         fprintf(stderr, "ds4-test: glm-mtp-payload-cross unknown mode %s\n", mode);
         TEST_ASSERT(false);
@@ -1277,10 +1426,34 @@ static void test_glm_mtp_payload_cross(void) {
                                                  err, sizeof(err));
     fclose(fp);
     fp = NULL;
-    /* A cold sync of the same prompt is the reference for everything below. */
-    TEST_ASSERT(ds4_session_create(&cold, engine, ctx) == 0 && cold);
-    TEST_ASSERT(ds4_session_sync(cold, &prompt, err, sizeof(err)) == 0);
-    mtp_engine = ds4_test_glm_mtp_cache_complete(cold);
+    /* A file written by "save" mode holds exactly the prompt, so a cold
+     * prefill of the restored history is an exact reference.  The "fail" mode
+     * file was saved after speculative decode cycles; prefill and decode differ
+     * numerically, so its reference is the writer's sidecar (see
+     * test_glm_mtp_payload_ref).  A refused load leaves no history, and the
+     * reference is the prompt the session re-syncs. */
+    int have_ref = 0;
+    if (load_rc == 0) {
+        have_ref = test_glm_mtp_payload_ref_read(ref_path, &ref);
+        TEST_ASSERT(have_ref >= 0);
+        if (have_ref < 0) goto cleanup;
+    }
+    if (have_ref) {
+        /* The writer's cache set was incomplete, so only an MTP-off engine
+         * reads this file and generates through the plain eval path. */
+        TEST_ASSERT(!mtp_requested);
+        mtp_engine = 0;
+    } else {
+        if (load_rc == 0) {
+            const ds4_tokens *h = ds4_session_tokens(session);
+            TEST_ASSERT(h != NULL);
+            for (int i = 0; h && i < h->len; i++) ds4_tokens_push(&restored_hist, h->v[i]);
+        }
+        TEST_ASSERT(ds4_session_create(&cold, engine, ctx) == 0 && cold);
+        TEST_ASSERT(ds4_session_sync(cold, load_rc == 0 ? &restored_hist : &prompt,
+                                     err, sizeof(err)) == 0);
+        mtp_engine = ds4_test_glm_mtp_cache_complete(cold);
+    }
     fprintf(stderr,
             "ds4-test: glm-mtp-payload-cross load mtp=%d requested=%d file=%ld "
             "load_rc=%d complete=%d\n", mtp_engine, mtp_requested ? 1 : 0,
@@ -1317,13 +1490,28 @@ static void test_glm_mtp_payload_cross(void) {
             TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
         }
     }
-    TEST_ASSERT(ds4_session_pos(session) == prompt.len);
+    {
+        /* The restored history starts with the prompt, and the reference
+         * (cold sync of that history, or the writer) sits at the same
+         * position. */
+        const ds4_tokens *h = ds4_session_tokens(session);
+        TEST_ASSERT(h != NULL && h->len >= prompt.len);
+        for (int i = 0; h && i < prompt.len && i < h->len; i++) {
+            TEST_ASSERT(h->v[i] == prompt.v[i]);
+        }
+        TEST_ASSERT(ds4_session_pos(session) ==
+                    (have_ref ? ref.pos : ds4_session_pos(cold)));
+    }
 
     {
         ds4_token_score got[8];
         ds4_token_score want[8];
         TEST_ASSERT(ds4_session_top_logprobs(session, got, 8) == 8);
-        TEST_ASSERT(ds4_session_top_logprobs(cold, want, 8) == 8);
+        if (have_ref) {
+            for (int i = 0; i < 8; i++) want[i] = ref.top[i];
+        } else {
+            TEST_ASSERT(ds4_session_top_logprobs(cold, want, 8) == 8);
+        }
         for (int i = 0; i < 8; i++) {
             fprintf(stderr,
                     "ds4-test: glm-mtp-payload-cross top[%d] cold=(%d,%.9g) "
@@ -1340,10 +1528,16 @@ static void test_glm_mtp_payload_cross(void) {
             (int)(sizeof(restored_tokens) / sizeof(restored_tokens[0])),
             err, sizeof(err));
         TEST_ASSERT(n_restored > 0);
-        const int n_cold = test_glm_mtp_payload_cross_generate(
-            cold, mtp_engine, cold_tokens,
-            (int)(sizeof(cold_tokens) / sizeof(cold_tokens[0])),
-            err, sizeof(err));
+        int n_cold;
+        if (have_ref) {
+            n_cold = ref.n;
+            memcpy(cold_tokens, ref.tokens, sizeof(cold_tokens));
+        } else {
+            n_cold = test_glm_mtp_payload_cross_generate(
+                cold, mtp_engine, cold_tokens,
+                (int)(sizeof(cold_tokens) / sizeof(cold_tokens[0])),
+                err, sizeof(err));
+        }
         TEST_ASSERT(n_cold > 0);
         TEST_ASSERT(n_restored == n_cold);
         if (n_restored == n_cold) {
@@ -1360,12 +1554,14 @@ static void test_glm_mtp_payload_cross(void) {
         fprintf(stderr,
                 "ds4-test: glm-mtp-payload-cross load ok mtp=%d tokens=%d "
                 "pos=%d/%d\n", mtp_engine, n_restored,
-                ds4_session_pos(session), ds4_session_pos(cold));
+                ds4_session_pos(session),
+                have_ref ? ref.pos + ref.n : ds4_session_pos(cold));
     }
 
 cleanup:
     if (fp) fclose(fp);
     ds4_tokens_free(&prompt);
+    ds4_tokens_free(&restored_hist);
     ds4_session_free(session);
     ds4_session_free(cold);
 }
@@ -9644,6 +9840,7 @@ static bool test_glm_mtp_commit_resample(ds4_engine *engine, ds4_session *sessio
         ds4_tokens_push(&prefix, history->v[i]);
     }
 
+    const int flag_before = ds4_test_glm_mtp_cache_complete(session) != 0;
     ds4_session_rewind(session, (int)(block->block_start + (uint32_t)block->ntok - 1u));
     if (ds4_session_pos(session) != (int)(block->block_start + (uint32_t)block->ntok - 1u)) {
         fprintf(stderr, "ds4-test: glm-mtp-commit %s: rewind left pos %d, want %u\n",
@@ -9654,6 +9851,18 @@ static bool test_glm_mtp_commit_resample(ds4_engine *engine, ds4_session *sessio
         free(row_pre);
         return false;
     }
+    /* The rewind only ever clears the cache-complete flag (ds4.c
+     * ds4_session_glm_mtp_rewind: no stored seam -> false); it never sets it.
+     * The legacy cycle never sets the flag, so it can already be 0 before the
+     * rewind: after it the flag holds iff it held before and the seam was
+     * stored with the dropped token (ticket 006). */
+    uint32_t seam_pos = 0;
+    int seam_written = -1;
+    int seam_valid = 0;
+    TEST_ASSERT(ds4_test_glm_mtp_seam_state(session, &seam_pos, &seam_written,
+                                            &seam_valid));
+    const int flag_after = ds4_test_glm_mtp_cache_complete(session) != 0;
+    TEST_ASSERT(flag_after == (flag_before && seam_valid != 0));
     int y = dropped;
     if (!same_token) {
         ds4_token_score top[8] = {0};
@@ -9766,12 +9975,34 @@ static double test_glm_mtp_commit_plain_eval(ds4_engine *engine,
         steps++;
         if (mtp_on) {
             if (!test_glm_mtp_commit_invariant(session, "plain-eval", i + 1)) break;
-            if (ds4_test_glm_mtp_read_floor(session) != floor0) {
-                fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: the read "
-                                "floor rose to %u without a failure\n",
-                        ds4_test_glm_mtp_read_floor(session));
-                TEST_ASSERT(false);
-                break;
+            const uint32_t floor_now = ds4_test_glm_mtp_read_floor(session);
+            const uint32_t len_now = (uint32_t)ds4_session_pos(session);
+            fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval step %d: "
+                            "floor=%u len=%u floor0=%u\n",
+                    i + 1, floor_now, len_now, floor0);
+            if (ds4_test_glm_mtp_dense(session)) {
+                /* The fast cycle fills the slot in the same batch: no failure,
+                 * so the floor must not move. */
+                if (floor_now != floor0) {
+                    fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: the "
+                                    "read floor rose to %u without a failure\n",
+                            floor_now);
+                    TEST_ASSERT(false);
+                    break;
+                }
+            } else if (i + 1 >= 2) {
+                /* The legacy cycle's plain decode writes no nextn slot.  Step 1
+                 * may rewrite the slot through the seam the sync stored; from
+                 * step 2 on ds4_session_glm_mtp_note_token finds the seam
+                 * invalidated and raises the floor to the checkpoint length at
+                 * that moment (ticket 005 rule 1), i.e. len - 1 after the step. */
+                if (!(len_now - 1u <= floor_now && floor_now <= len_now)) {
+                    fprintf(stderr, "ds4-test: glm-mtp-commit plain-eval: legacy "
+                                    "floor %u outside [len-1, len] = [%u, %u]\n",
+                            floor_now, len_now - 1u, len_now);
+                    TEST_ASSERT(false);
+                    break;
+                }
             }
         }
     }
@@ -10152,6 +10383,8 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
             floor_before, ds4_test_glm_mtp_read_floor(session), pos_at_failure);
     TEST_ASSERT(failures == 1);
     TEST_ASSERT(cycle_at_failure >= 0);
+    /* After the injected write failure, the cache-complete flag must be cleared. */
+    TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session) == 0);
     ok = failures == 1 && cycle_at_failure >= 0;
     if (kind == DS4_TEST_GLM_MTP_FAIL_CHAIN) {
         /* A chained draft row is overwritten before anything reads it, so the
