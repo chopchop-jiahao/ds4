@@ -45189,11 +45189,16 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *layer_kv_lora_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_k_rope_cache[DS4_MAX_LAYER];
     /* GLM MTP (nextn block) drafting: private compact caches for the nextn
-     * layer (slot = absolute position; only [mtp_min_pos..pos] is ever
-     * selected) plus small scratch. Allocated lazily on first draft. */
+     * layer (slot = absolute position) plus small scratch. Allocated lazily on
+     * first draft.  Which slots a row reads is the row's own choice on the
+     * GLM-5.3 fast cycle (mtp_select_ids below) and the host's [min_pos..pos]
+     * window everywhere else. */
     ds4_gpu_tensor *mtp_kv_lora_cache;
     ds4_gpu_tensor *mtp_k_rope_cache;
     ds4_gpu_tensor *mtp_concat;
+    /* The window the host wrote for a row that does not select its own
+     * positions: the contiguous [min_pos..pos] of ticket 001.  The GLM-5.3 fast
+     * cycle leaves it untouched and reads mtp_select_ids instead. */
     ds4_gpu_tensor *mtp_selected;
     ds4_gpu_tensor *mtp_state_backup;
     float          *mtp_logits_host;
@@ -45220,6 +45225,48 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *mtp_indexer_key_cache;
     ds4_gpu_tensor *mtp_indexer_tail_k;
     ds4_gpu_tensor *mtp_indexer_tail_gate;
+    /* GLM-5.3 nextn position selection (ticket 007): the nextn block picks the
+     * positions its attention reads with its *own* indexer, over [0..pos],
+     * exactly like a trunk DSA layer picks its decode positions.  The scratch
+     * mirrors the trunk's indexer scratch and is never shared with it. */
+    ds4_gpu_tensor *mtp_select_q;      /* [indexer_head][indexer_head_dim] f32 */
+    ds4_gpu_tensor *mtp_select_weights;/* [indexer_head] f32 */
+    ds4_gpu_tensor *mtp_select_scores; /* [pool_cap(cache_cap)] f32 */
+    ds4_gpu_tensor *mtp_select_pools;  /* [indexer_top_k / pool] u32 */
+    ds4_gpu_tensor *mtp_select_ids;    /* [indexer_top_k + pool - 1] u32 */
+    /* Two constants that keep slots below the read floor out of a selection
+     * with GPU copies only (a host write would land before the batch runs):
+     * mtp_select_iota[i] = i, so iota[floor..visible) is the range of every
+     * readable position when it fits one selection, and mtp_select_skip is
+     * -FLT_MAX (the lowest score; the top-k kernel compares plain floats),
+     * copied over the scores of the pools that hold a slot below the floor so
+     * the top-k cannot take them. */
+    ds4_gpu_tensor *mtp_select_iota;   /* [cache_cap] u32 */
+    ds4_gpu_tensor *mtp_select_skip;   /* [pool_cap(cache_cap)] f32 */
+    /* The choice the last step-0 nextn row left in mtp_select_ids.  A chained
+     * draft reuses it unchanged (vLLM compact_topk_indices moves the last row's
+     * top-k to the front of the buffer), so the graph has to remember which
+     * position made it and how wide it was. */
+    uint32_t        mtp_select_pos;
+    uint32_t        mtp_select_count;
+    bool            mtp_select_valid;
+    /* What the last position-selecting row was told to stay above, how many
+     * rows have selected since the graph was built, and the buffer and count
+     * the last nextn attention call (any row, chained or not) really read.
+     * Only the tests read them. */
+    uint32_t        mtp_select_floor;
+    uint64_t        mtp_select_rows;
+    /* The last row that picked its own positions, kept apart from the reuse
+     * state above: only glm53_graph_mtp_select_positions writes it, so neither
+     * a chained draft (which moves mtp_select_pos on) nor a rewind (which
+     * clears the reuse state) changes it.  The ids it chose stay in
+     * mtp_select_ids until the next selection overwrites them.  Only the tests
+     * read it; mtp_select_rows > 0 says it holds a row. */
+    uint32_t        mtp_last_pos;
+    uint32_t        mtp_last_floor;
+    uint32_t        mtp_last_count;
+    const ds4_gpu_tensor *mtp_attn_selected;
+    uint32_t        mtp_attn_n_selected;
     /* Fixed-capacity prefill fill scratch: one group of nextn rows at a time,
      * so a filled prompt token costs only the pooled indexer key share. */
     ds4_gpu_tensor *mtp_fill_tokens;       /* [fill_token_cap] int32, host-written */
@@ -47116,6 +47163,13 @@ static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->mtp_indexer_tail_gate);
     ds4_gpu_tensor_free(g->mtp_indexer_tail_k);
     ds4_gpu_tensor_free(g->mtp_indexer_key_cache);
+    ds4_gpu_tensor_free(g->mtp_select_q);
+    ds4_gpu_tensor_free(g->mtp_select_weights);
+    ds4_gpu_tensor_free(g->mtp_select_scores);
+    ds4_gpu_tensor_free(g->mtp_select_pools);
+    ds4_gpu_tensor_free(g->mtp_select_ids);
+    ds4_gpu_tensor_free(g->mtp_select_iota);
+    ds4_gpu_tensor_free(g->mtp_select_skip);
     ds4_gpu_tensor_free(g->mtp_seam_hidden);
     ds4_gpu_tensor_free(g->mtp_seam_token);
     ds4_gpu_tensor_free(g->mtp_fill_tokens);
@@ -47153,6 +47207,18 @@ static void glm_graph_mtp_free(ds4_glm_gpu_graph *g) {
     g->mtp_indexer_tail_gate = NULL;
     g->mtp_indexer_tail_k = NULL;
     g->mtp_indexer_key_cache = NULL;
+    g->mtp_select_q = NULL;
+    g->mtp_select_weights = NULL;
+    g->mtp_select_scores = NULL;
+    g->mtp_select_pools = NULL;
+    g->mtp_select_ids = NULL;
+    g->mtp_select_iota = NULL;
+    g->mtp_select_skip = NULL;
+    g->mtp_select_pos = DS4_GLM_MTP_NO_SLOT;
+    g->mtp_select_count = 0;
+    g->mtp_select_valid = false;
+    g->mtp_attn_selected = NULL;
+    g->mtp_attn_n_selected = 0;
     g->mtp_seam_hidden = NULL;
     g->mtp_seam_token = NULL;
     g->mtp_ledger_token = NULL;
@@ -51510,9 +51576,13 @@ static bool glm_graph_begin_commands_if_needed(void);
  * only position that ever lags is the newest one, whose next token does not
  * exist yet: its post-norm trunk hidden is parked in the seam and its slot is
  * written as soon as the token does exist.  Positions past the checkpoint stay
- * unwritten, and the drafter only ever selects positions <= checkpoint.len-1
- * (its own current row included), so no unwritten slot is ever read.  GLM-5.2
- * has no indexer and its cache stays the drafted-window-only design.
+ * unwritten.  Since ticket 007 the drafter picks the positions it attends to
+ * with its own indexer out of everything up to and including the row it is
+ * encoding: below the dense limit that is the whole [0..pos] range, above it
+ * the indexer scores the pools and only the winning ones are read, so a
+ * position below the running one is not automatically read either -- but
+ * nothing above it ever is, so no unwritten slot is ever read.  GLM-5.2 has no
+ * indexer and its cache stays the drafted-window-only design.
  * --------------------------------------------------------------------- */
 /* Capacity of the nextn KV and indexer caches, in slots: the same slot count
  * the trunk's compact cache uses (its full-attention context when the compact
@@ -51680,6 +51750,28 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
                 g->mtp_indexer_tail_k, mtp_indexer_tail_bytes,
                 mtp_indexer_tail_bytes);
         }
+        /* Position-selection scratch for the nextn block (ticket 007), sized by
+         * the same formulas the trunk uses for its own indexer scratch: one
+         * query row, one head-weight row, one score per pooled row of the
+         * nextn cache, one slot per pool the top-k can take and one id per
+         * position a selection can ever hold. */
+        g->mtp_select_q = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+        g->mtp_select_weights = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
+        g->mtp_select_scores = ds4_gpu_tensor_alloc(
+            (uint64_t)glm53_graph_indexer_pool_cap(cache_cap) * sizeof(float));
+        g->mtp_select_pools = ds4_gpu_tensor_alloc(
+            (uint64_t)(DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE) *
+            sizeof(uint32_t));
+        g->mtp_select_ids = ds4_gpu_tensor_alloc(
+            (uint64_t)glm53_graph_indexer_selected_limit() * sizeof(uint32_t));
+        /* Constants for the read floor: one id per cache slot, one -FLT_MAX per
+         * pooled row of the nextn cache (filled below, once). */
+        g->mtp_select_iota = ds4_gpu_tensor_alloc(
+            (uint64_t)cache_cap * sizeof(uint32_t));
+        g->mtp_select_skip = ds4_gpu_tensor_alloc(
+            (uint64_t)glm53_graph_indexer_pool_cap(cache_cap) * sizeof(float));
         /* The seam hidden is a fixed [embd] slot: it does not follow --ctx. */
         g->mtp_seam_hidden = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EMBD * sizeof(float));
         g->mtp_seam_token = ds4_gpu_tensor_alloc(sizeof(int32_t));
@@ -51718,6 +51810,10 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
                       !g->mtp_hc_rows || !g->mtp_chain_hidden ||
                       !g->mtp_hc_postnorm || !g->mtp_indexer_key_cache ||
                       !g->mtp_indexer_tail_k || !g->mtp_indexer_tail_gate ||
+                      !g->mtp_select_q || !g->mtp_select_weights ||
+                      !g->mtp_select_scores || !g->mtp_select_pools ||
+                      !g->mtp_select_ids || !g->mtp_select_iota ||
+                      !g->mtp_select_skip ||
                       !g->mtp_seam_hidden || !g->mtp_seam_token ||
                       !g->mtp_fill_tokens || !g->mtp_fill_embed ||
                       !g->mtp_fill_hidden ||
@@ -51728,13 +51824,15 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
         !g->mtp_logits_host) {
         fprintf(stderr,
                 "ds4: glm mtp: allocation failed kv=%s rope=%s concat=%s "
-                "selected=%s state_backup=%s indexer_pool=%s fill=%s logits=%s\n",
+                "selected=%s state_backup=%s indexer_pool=%s mtp_select=%s "
+                "fill=%s logits=%s\n",
                 g->mtp_kv_lora_cache ? "ok" : "missing",
                 g->mtp_k_rope_cache ? "ok" : "missing",
                 g->mtp_concat ? "ok" : "missing",
                 g->mtp_selected ? "ok" : "missing",
                 (!g->glm53 || g->mtp_state_backup) ? "ok" : "missing",
                 (!g->glm53 || g->mtp_indexer_key_cache) ? "ok" : "missing",
+                (!g->glm53 || g->mtp_select_ids) ? "ok" : "missing",
                 (!g->glm53 || g->mtp_fill_concat) ? "ok" : "missing",
                 g->mtp_logits_host ? "ok" : "missing");
         glm_graph_mtp_free(g);
@@ -51750,6 +51848,28 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
             ds4_gpu_tensor_fill_f32(g->mtp_indexer_tail_gate, 0.0f,
                                     tail_values) == 0) {
             fprintf(stderr, "ds4: glm mtp: indexer tail reset failed\n");
+            glm_graph_mtp_free(g);
+            return false;
+        }
+        /* The two selection constants never change once written, and host
+         * writes land immediately, so they are written here and only ever
+         * copied from inside a command batch. */
+        uint32_t *iota = malloc((size_t)cache_cap * sizeof(uint32_t));
+        bool consts_ok = iota != NULL;
+        if (consts_ok) {
+            for (uint32_t i = 0; i < cache_cap; i++) iota[i] = i;
+            consts_ok = ds4_gpu_tensor_write(g->mtp_select_iota, 0, iota,
+                                             (uint64_t)cache_cap *
+                                                 sizeof(uint32_t)) != 0;
+        }
+        free(iota);
+        if (consts_ok) {
+            consts_ok = ds4_gpu_tensor_fill_f32(
+                    g->mtp_select_skip, -FLT_MAX,
+                    glm53_graph_indexer_pool_cap(cache_cap)) != 0;
+        }
+        if (!consts_ok) {
+            fprintf(stderr, "ds4: glm mtp: selection constants failed\n");
             glm_graph_mtp_free(g);
             return false;
         }
@@ -51827,9 +51947,176 @@ static bool glm_graph_mtp_matmul(
                                                false) != 0;
 }
 
+/* Ticket 007: pick the positions the nextn row at absolute position pos
+ * attends to, with the nextn block's *own* indexer over the whole [0..pos]
+ * range, exactly like a trunk DSA layer picks its decode positions (the
+ * use_indexed_attention block of glm_graph_forward_token).  The row's key,
+ * gate and pool entry are written before this runs, so the pool that position
+ * pos completes is already scored.  While the readable positions
+ * [floor..pos] still fit the dense limit every one of them is selected; above
+ * it the blk.45 indexer scores every whole pool, the top pools expand to their
+ * POOL positions each and the incomplete tail pool is appended whole.  The
+ * choice stays in g->mtp_select_ids until the command batch ends, which is
+ * what lets a chained draft reuse the last step-0 row's choice without
+ * touching it.
+ *
+ * floor is the session's ticket-005 read floor (the first slot that holds a
+ * token the checkpoint still keeps): no slot below it may be selected, because
+ * it was written wrong, never written, or given up on.  With floor 0 this is
+ * exactly the trunk's selection.  Above 0 the same two branches run on the
+ * readable range: the dense one copies iota[floor..visible), and the top-k one
+ * sends every pool that holds a slot below the floor (the first
+ * ceil(floor / POOL) pools, the one straddling the floor included) to -FLT_MAX
+ * before the top-k, so a pool that straddles the floor is dropped whole.  The
+ * top-k branch only runs when more than the dense limit of positions are
+ * readable, which leaves at least selected_pools whole pools above the floor
+ * (checked below), and the tail pool then starts above the floor too. */
+static bool glm53_graph_mtp_select_positions(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 pos,
+        uint32_t                 cache_cap,
+        uint32_t                 floor,
+        uint32_t                *n_selected_out) {
+    const uint32_t selected_limit = glm53_graph_indexer_selected_limit();
+    const uint32_t visible = pos + 1u;
+    const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+    if (!g || !model || !l || !n_selected_out ||
+        !l->indexer_attn_q_b || !l->indexer_proj ||
+        !g->mtp_select_ids || !g->mtp_select_q || !g->mtp_select_weights ||
+        !g->mtp_select_scores || !g->mtp_select_pools ||
+        !g->mtp_select_iota || !g->mtp_select_skip ||
+        !g->mtp_indexer_key_cache) {
+        return false;
+    }
+    if (floor > pos) {
+        fprintf(stderr,
+                "ds4: glm mtp: read floor %u is above pos %u\n", floor, pos);
+        return false;
+    }
+    /* What the host says the row must select: every readable position while
+     * they fit the dense limit, one whole pool expansion once they do not.
+     * Checked before anything is dispatched, so an out-of-range draft never
+     * reaches a kernel. */
+    const uint32_t readable = visible - floor;
+    const bool dense = readable <= dense_limit;
+    const uint32_t expected = dense ? readable : selected_limit;
+    /* Pools that hold a slot below the floor. */
+    const uint32_t skip_pools =
+        (floor + DS4_GLM53_INDEX_POOL_SIZE - 1u) / DS4_GLM53_INDEX_POOL_SIZE;
+    if (expected > selected_limit || pos >= cache_cap) {
+        fprintf(stderr,
+                "ds4: glm mtp: %u selected positions at pos %u do not fit the "
+                "limit %u (cache cap %u)\n",
+                expected, pos, selected_limit, cache_cap);
+        return false;
+    }
+    if (!dense &&
+        visible / DS4_GLM53_INDEX_POOL_SIZE <
+            skip_pools + DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE) {
+        fprintf(stderr,
+                "ds4: glm mtp: pos %u above floor %u leaves fewer than %u "
+                "whole pools to select from\n",
+                pos, floor,
+                DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE);
+        return false;
+    }
+
+    bool ok;
+    if (dense) {
+        if (floor == 0) {
+            ok = ds4_gpu_glm_fill_selected_range_tensor(g->mtp_select_ids,
+                                                        visible) != 0;
+        } else {
+            ok = ds4_gpu_tensor_copy(g->mtp_select_ids, 0,
+                                     g->mtp_select_iota,
+                                     (uint64_t)floor * sizeof(uint32_t),
+                                     (uint64_t)readable * sizeof(uint32_t)) != 0;
+        }
+    } else {
+        const float scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM *
+                                                 DS4_N_INDEXER_HEAD));
+        /* Only whole pools are scored; the incomplete one comes in through the
+         * expansion, so it is always selected. */
+        const uint32_t score_rows = visible / DS4_GLM53_INDEX_POOL_SIZE;
+        const uint32_t selected_pools =
+            DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE;
+        ok = glm53_graph_matmul(g->mtp_select_q,
+                                model,
+                                l->indexer_attn_q_b,
+                                DS4_N_LORA_Q,
+                                (uint32_t)DS4_N_INDEXER_HEAD *
+                                    DS4_N_INDEXER_HEAD_DIM,
+                                g->q_rank_norm);
+        if (ok && glm_graph_indexer_qat()) {
+            ok = ds4_gpu_dsv4_indexer_qat_tensor(g->mtp_select_q,
+                                                 DS4_N_INDEXER_HEAD,
+                                                 DS4_N_INDEXER_HEAD_DIM) != 0;
+        }
+        if (ok) {
+            ok = glm53_graph_matmul(g->mtp_select_weights,
+                                    model,
+                                    l->indexer_proj,
+                                    DS4_N_EMBD,
+                                    DS4_N_INDEXER_HEAD,
+                                    g->attn_norm);
+        }
+        if (ok) {
+            ok = ds4_gpu_glm_indexer_score_one_tensor(
+                    g->mtp_select_scores,
+                    g->mtp_select_q,
+                    g->mtp_select_weights,
+                    g->mtp_indexer_key_cache,
+                    score_rows,
+                    DS4_N_INDEXER_HEAD,
+                    DS4_N_INDEXER_HEAD_DIM,
+                    scale,
+                    glm_graph_compact_cache_is_f16()) != 0;
+        }
+        if (ok && skip_pools != 0) {
+            ok = ds4_gpu_tensor_copy(g->mtp_select_scores, 0,
+                                     g->mtp_select_skip, 0,
+                                     (uint64_t)skip_pools * sizeof(float)) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_indexer_topk_tensor(g->mtp_select_pools,
+                                             g->mtp_select_scores,
+                                             score_rows,
+                                             1,
+                                             selected_pools) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_glm53_expand_pool_selection_tensor(
+                    g->mtp_select_ids,
+                    g->mtp_select_pools,
+                    1,
+                    pos,
+                    selected_pools,
+                    DS4_N_INDEXER_TOP_K,
+                    DS4_GLM53_INDEX_POOL_SIZE,
+                    selected_limit) != 0;
+        }
+    }
+    if (ok) {
+        g->mtp_select_pos = pos;
+        g->mtp_select_count = expected;
+        g->mtp_select_valid = true;
+        g->mtp_select_floor = floor;
+        g->mtp_select_rows++;
+        g->mtp_last_pos = pos;
+        g->mtp_last_floor = floor;
+        g->mtp_last_count = expected;
+        *n_selected_out = expected;
+    }
+    return ok;
+}
+
 /* Encode one nextn block row into the open command batch: input
  * concat(enorm(embed_row), hnorm(hidden)) at absolute position pos, attention
- * over MTP cache slots g->mtp_selected[0..n_selected), output in g->next.
+ * over the cache slots selected_ids[0..n_selected) (the fast cycle lets the
+ * nextn indexer pick them itself, see glm53_graph_mtp_select_positions),
+ * output in g->next.
  * hidden_hc: hidden is an mHC row.  It is reduced with hc_mean_weights and
  *   then put through the trunk's output_norm, so the nextn block is conditioned
  *   on the same post-norm hidden the trunk head turns into logits (vLLM
@@ -51839,7 +52126,12 @@ static bool glm_graph_mtp_matmul(
  *   writes its own.  vLLM's glm5next MLA runs the nextn indexer for every row
  *   that reads the trunk hidden and skips it only for the chained draft
  *   (skip_topk), so the chained caller passes false.
- * Callers write g->mtp_selected and every input row before encoding. */
+ * indexer_select: the row picks its own positions with the nextn indexer
+ *   (ticket 007), none of them below select_floor (the read floor); selected
+ *   and n_selected then only carry the choice a chained draft reuses, which is
+ *   the buffer the previous step-0 row left behind.
+ * Callers write every input row, and selected[] when !indexer_select, before
+ * encoding. */
 static bool glm_graph_mtp_encode_row(
         ds4_glm_gpu_graph    *g,
         const ds4_model      *model,
@@ -51848,7 +52140,10 @@ static bool glm_graph_mtp_encode_row(
         const ds4_gpu_tensor *hidden,
         bool                  hidden_hc,
         bool                  indexer_store,
+        bool                  indexer_select,
+        ds4_gpu_tensor       *selected,
         uint32_t              pos,
+        uint32_t              select_floor,
         uint32_t              n_selected,
         const char          **stage_out) {
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
@@ -51863,6 +52158,14 @@ static bool glm_graph_mtp_encode_row(
             l->indexer_attn_k && l->indexer_compressor_gate &&
             l->indexer_k_norm && l->indexer_k_norm_b &&
             l->indexer_compressor_ape;
+    /* A row that does not write its own indexer key cannot score the pool it
+     * completes, so it cannot pick positions either. */
+    if (indexer_select && !store_indexer) {
+        fprintf(stderr,
+                "ds4: glm mtp: position selection at pos %u has no indexer "
+                "store to score\n", pos);
+        return false;
+    }
     const char *mtp_stage = "enorm";
     bool ok = true;
     ds4_gpu_tensor *enorm_view =
@@ -51933,9 +52236,12 @@ static bool glm_graph_mtp_encode_row(
                                       2u * DS4_N_EMBD,
                                       DS4_N_EMBD,
                                       g->mtp_concat);
-    /* nextn attention (full causal over the MTP window, no indexer: the
-     * window is selected by position, ticket 001).  The row's own indexer
-     * key/pool entry above is written for the cache, not read here. */
+    /* nextn attention over the positions this row reads: the ones its own
+     * indexer picked out of [0..pos] where the session selects (ticket 007,
+     * see glm53_graph_mtp_select_positions), otherwise the contiguous host-
+     * written window.  Either way the row's own indexer key/pool entry written
+     * just above is what the selection is scored against, and the attention
+     * itself reads the KV cache the same way for both. */
     DS4_GLM_MTP_STAGE("attn_norm");
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
                                                 g->cur,
@@ -52057,6 +52363,16 @@ static bool glm_graph_mtp_encode_row(
                     glm_graph_compact_cache_is_f16()) != 0;
         }
     }
+    /* The row picks its own attention positions now that its key, gate and
+     * pool entry are in the nextn indexer caches. */
+    if (ok && indexer_select) {
+        DS4_GLM_MTP_STAGE("indexer_select");
+        ok = glm53_graph_mtp_select_positions(g, model, l, pos, cache_cap,
+                                              select_floor, &n_selected);
+        selected = g->mtp_select_ids;
+    }
+    g->mtp_attn_selected = selected;
+    g->mtp_attn_n_selected = n_selected;
     DS4_GLM_MTP_STAGE("qk_low");
     if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(g->qk_low,
                                                      g->q,
@@ -52078,7 +52394,7 @@ static bool glm_graph_mtp_encode_row(
                                                                    model->size,
                                                                    l->attn_v_b->abs_offset,
                                                                    l->attn_v_b->type,
-                                                                   g->mtp_selected,
+                                                                   selected,
                                                                    n_selected,
                                                                    cache_cap,
                                                                    glm_graph_compact_cache_is_f16(),
@@ -52290,7 +52606,13 @@ static void glm53_graph_mtp_ledger_chain(ds4_glm_gpu_graph *g,
  * encode_row reduces and puts through output_norm) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
  * drafted token[pos+2] by greedy argmax.  g->mtp_seam_save additionally parks
- * this row's post-norm hidden as the seam.  Clobbers the decode scratch. */
+ * this row's post-norm hidden as the seam.  Clobbers the decode scratch.
+ *
+ * indexer_select (ticket 007) is the GLM-5.3 fast cycle: the row picks its own
+ * attention positions over [min_pos..pos] with the nextn indexer, where min_pos
+ * is then only the ticket-005 read floor (nothing below it may be selected;
+ * 0 on a clean session).  Without it the window is the host-written contiguous
+ * [min_pos..pos] every other configuration has always used. */
 static bool glm_graph_mtp_step(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52298,9 +52620,11 @@ static bool glm_graph_mtp_step(
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
+        bool               indexer_select,
         int               *draft_out) {
     if (!g || !model || !weights || !draft_out) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
+    const bool select = indexer_select && g->glm53;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (pos >= cache_cap || min_pos > pos) {
         fprintf(stderr, "ds4: glm mtp: pos %u/min %u out of range (cap %u)\n",
@@ -52319,9 +52643,8 @@ static bool glm_graph_mtp_step(
         fprintf(stderr, "ds4: glm mtp: nextn weights missing at layer %u\n", il);
         return false;
     }
-    const uint32_t n_selected = pos - min_pos + 1u;
+    const uint32_t n_selected = select ? 0u : pos - min_pos + 1u;
     bool input_ready = false;
-
     if (g->placement) {
         const int embedding_tier = g->placement[0];
         const int mtp_tier = g->placement[il + 1u];
@@ -52354,8 +52677,10 @@ static bool glm_graph_mtp_step(
         return false;
     }
 
-    /* Draft attention window: absolute cache slots [min_pos..pos]. */
-    {
+    /* Draft attention window: the row's own indexer choice over
+     * [min_pos..pos], or the absolute cache slots [min_pos..pos] the host
+     * wrote. */
+    if (!select) {
         int32_t *sel = malloc((size_t)n_selected * sizeof(int32_t));
         if (!sel) return false;
         for (uint32_t i = 0; i < n_selected; i++) sel[i] = (int32_t)(min_pos + i);
@@ -52379,7 +52704,10 @@ static bool glm_graph_mtp_step(
                                           g->glm53 ? g->hc_cur : g->cur,
                                           g->glm53,
                                           true,
+                                          select,
+                                          g->mtp_selected,
                                           pos,
+                                          min_pos,
                                           n_selected,
                                           &mtp_stage);
 
@@ -52457,7 +52785,15 @@ static bool glm_graph_mtp_step(
  * qwen4_graph_mtp_steps: row t consumes the trunk mHC row hc_rows[t] (reduced
  * and put through output_norm by encode_row) and next_tokens[t] at position
  * pos + t and writes MTP cache slot pos + t.  Only the last row runs the
- * output head; its argmax is the next draft. */
+ * output head; its argmax is the next draft.
+ *
+ * With indexer_select (the GLM-5.3 fast cycle) every row picks its own
+ * positions over [min_pos..pos+t] with the nextn indexer, min_pos being the
+ * ticket-005 read floor there (0 on a clean session);
+ * the rows share one selection scratch, which is safe because they encode in
+ * order inside one command batch, and the LAST row's choice is what stays in
+ * it for a chained draft.  Without it the window is the contiguous host-written
+ * [min_pos..pos+t] the other configurations have always used. */
 static bool glm53_graph_mtp_rows(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52467,11 +52803,13 @@ static bool glm53_graph_mtp_rows(
         uint32_t           n,
         uint32_t           pos,
         uint32_t           min_pos,
+        bool               indexer_select,
         int               *draft_out) {
     if (!g || !g->glm53 || !model || !weights || !next_tokens || !hc_rows ||
         !draft_out || n == 0 || n > 3u || g->placement) {
         return false;
     }
+    const bool select = indexer_select && g->glm53;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (min_pos > pos || pos + n > cache_cap) return false;
     if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_ROWS)) {
@@ -52492,14 +52830,20 @@ static bool glm53_graph_mtp_rows(
         if (next_tokens[t] < 0 || next_tokens[t] >= (int)DS4_N_VOCAB) return false;
         ids[t] = (int32_t)next_tokens[t];
     }
-    /* Every row's window is a prefix of the last row's [min_pos..pos+n-1]. */
-    const uint32_t n_selected_last = pos + n - min_pos;
-    int32_t *sel = malloc((size_t)n_selected_last * sizeof(int32_t));
-    if (!sel) return false;
-    for (uint32_t i = 0; i < n_selected_last; i++) sel[i] = (int32_t)(min_pos + i);
-    bool ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
-                                   (uint64_t)n_selected_last * sizeof(int32_t)) != 0;
-    free(sel);
+    /* Without the indexer every row's window is a prefix of the last row's
+     * [min_pos..pos+n-1], so one host write covers all of them. */
+    bool ok = true;
+    if (!select) {
+        const uint32_t n_selected_last = pos + n - min_pos;
+        int32_t *sel = malloc((size_t)n_selected_last * sizeof(int32_t));
+        if (!sel) return false;
+        for (uint32_t i = 0; i < n_selected_last; i++) {
+            sel[i] = (int32_t)(min_pos + i);
+        }
+        ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
+                                  (uint64_t)n_selected_last * sizeof(int32_t)) != 0;
+        free(sel);
+    }
     const uint64_t hc_row_bytes = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
     const uint64_t emb_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     /* Host writes land immediately: write every input before encoding. */
@@ -52533,7 +52877,8 @@ static bool glm53_graph_mtp_rows(
         ds4_gpu_tensor *h_row = ds4_gpu_tensor_view(g->mtp_hc_rows, t * hc_row_bytes, hc_row_bytes);
         ok = e_row && h_row &&
              glm_graph_mtp_encode_row(g, model, weights, e_row, h_row, true,
-                                      true, pos + t, pos + t - min_pos + 1u,
+                                      true, select, g->mtp_selected, pos + t,
+                                      min_pos, pos + t - min_pos + 1u,
                                       &mtp_stage);
         ds4_gpu_tensor_free(h_row);
         ds4_gpu_tensor_free(e_row);
@@ -52593,7 +52938,14 @@ static bool glm53_graph_mtp_rows(
  * (g->mtp_chain_hidden, the same value the previous draft logits came from)
  * instead of a trunk row; this row's hnorm normalises it a second time, like
  * vLLM.  Writes MTP cache slot pos speculatively; the next catch-up overwrites
- * it with the true trunk row. */
+ * it with the true trunk row.
+ *
+ * indexer_select (the GLM-5.3 fast cycle) is vLLM's skip_topk: this row reuses
+ * the choice the previous step-0 row (a plain step, or the last row of a
+ * catch-up) left in g->mtp_select_ids, position for position, without adding
+ * its own position and without re-scoring.  With no such choice recorded, or
+ * one that is not the immediately preceding position, the draft fails rather
+ * than falling back to some other window. */
 static bool glm53_graph_mtp_chain(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -52601,12 +52953,14 @@ static bool glm53_graph_mtp_chain(
         int                next_token,
         uint32_t           pos,
         uint32_t           min_pos,
+        bool               indexer_select,
         int               *draft_out) {
     if (!g || !g->glm53 || !model || !weights || !draft_out || g->placement) {
         return false;
     }
+    const bool select = indexer_select && g->glm53;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
-    if (min_pos > pos || pos >= cache_cap) return false;
+    if ((!select && min_pos > pos) || pos >= cache_cap) return false;
     if (glm53_graph_mtp_fail_take(g, DS4_TEST_GLM_MTP_FAIL_CHAIN)) {
         fprintf(stderr, "ds4: glm mtp chain failed at stage 'inject' (pos %u)\n", pos);
         glm53_graph_mtp_note_write_failed(g, pos, true);
@@ -52618,20 +52972,48 @@ static bool glm53_graph_mtp_chain(
     const uint32_t il = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const ds4_layer_weights *l = &weights->layer[il];
     if (!l->nextn_eh_proj || !l->nextn_shared_head_norm) return false;
-    const uint32_t n_selected = pos - min_pos + 1u;
-    int32_t *sel = malloc((size_t)n_selected * sizeof(int32_t));
-    if (!sel) return false;
-    for (uint32_t i = 0; i < n_selected; i++) sel[i] = (int32_t)(min_pos + i);
-    bool ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
-                                   (uint64_t)n_selected * sizeof(int32_t)) != 0;
-    free(sel);
+    uint32_t n_selected = 0;
+    ds4_gpu_tensor *selected = g->mtp_selected;
+    bool ok = true;
+    if (select) {
+        const uint32_t limit = glm53_graph_indexer_selected_limit();
+        if (!g->mtp_select_valid || !g->mtp_select_ids ||
+            g->mtp_select_pos == DS4_GLM_MTP_NO_SLOT ||
+            g->mtp_select_pos + 1u != pos ||
+            g->mtp_select_count == 0 ||
+            g->mtp_select_count > limit) {
+            fprintf(stderr,
+                    "ds4: glm mtp chain: no draft selection to reuse at pos %u "
+                    "(last pos %u, %u selected)\n", pos,
+                    g->mtp_select_valid ? g->mtp_select_pos : 0u,
+                    g->mtp_select_count);
+            return false;
+        }
+        selected = g->mtp_select_ids;
+        n_selected = g->mtp_select_count;
+    } else {
+        const uint32_t n_selected_host = pos - min_pos + 1u;
+        int32_t *sel = malloc((size_t)n_selected_host * sizeof(int32_t));
+        if (!sel) return false;
+        for (uint32_t i = 0; i < n_selected_host; i++) {
+            sel[i] = (int32_t)(min_pos + i);
+        }
+        ok = ds4_gpu_tensor_write(g->mtp_selected, 0, sel,
+                                  (uint64_t)n_selected_host * sizeof(int32_t)) != 0;
+        free(sel);
+        n_selected = n_selected_host;
+    }
     const char *mtp_stage = "embed";
     if (ok) ok = glm_graph_begin_commands_if_needed();
     if (ok) ok = glm_graph_mtp_embed_token(g, model, weights, next_token, g->next);
     if (ok) ok = glm_graph_mtp_encode_row(g, model, weights, g->next,
                                          g->mtp_chain_hidden, false,
-                                         false,
-                                         pos, n_selected, &mtp_stage);
+                                         false, false, selected,
+                                         pos, 0u, n_selected, &mtp_stage);
+    if (ok && select) {
+        /* The reused choice stays where the step-0 row left it. */
+        g->mtp_select_pos = pos;
+    }
     if (ok) mtp_stage = "head";
     if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                 g->next,
@@ -52695,6 +53077,12 @@ static void glm53_graph_mtp_clear_requests(ds4_glm_gpu_graph *g) {
     g->mtp_fill_next = NULL;
     g->mtp_seam_flush = -1;
     g->mtp_seam_save = false;
+    /* The selection a chained draft would reuse is per request too: once the
+     * queued writes are gone the checkpoint moved, and a chained draft may only
+     * ever reuse the selection of the plain step right before it. */
+    g->mtp_select_valid = false;
+    g->mtp_select_pos = 0u;
+    g->mtp_select_count = 0u;
 }
 
 /* The fill writes the nextn KV slot always and the nextn indexer only when the
@@ -61835,10 +62223,13 @@ struct ds4_session {
     int glm_mtp_rollback_first_token;
     int glm_spec_inside;
     /* MTP draft attention window start (absolute position) for the request
-     * that is generating now.  The nextn KV cache only holds positions this
-     * request produced, so the start is decided at the request's first plain
-     * MTP step and never moves inside the request.  Position 0 is a legal
-     * start, so validity is tracked separately from the value. */
+     * that is generating now.  On the configurations that read a host-named
+     * window the nextn KV cache only holds positions this request produced, so
+     * the start is decided at the request's first plain MTP step and never moves
+     * inside the request.  Position 0 is a legal start, so validity is tracked
+     * separately from the value.  A GLM-5.3 fast-cycle session that picks its
+     * own positions (ticket 007) still records it, but nothing it drafts reads
+     * it: see ds4_session_glm_mtp_selects_positions(). */
     uint32_t glm_mtp_min_pos;
     bool glm_mtp_min_pos_valid;
     /* Ticket 005 read floor: the first nextn cache slot a draft may read.  A
@@ -62871,9 +63262,11 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
  * window start is no longer "the first row the drafter itself wrote" but
  * "the first position this request generated", and that is only known at the
  * request's first plain MTP step (see ds4_session_glm_note_mtp_window_start).
- * The seam is deliberately *not* touched here: a resumed request still owns
- * the previous request's last position and rewrites it with the real first
- * prompt token. */
+ * Since ticket 007 only the sessions that still read a host-named window use
+ * that start; a GLM-5.3 fast-cycle session picks its own positions from 0 and
+ * ignores it.  The seam is deliberately *not* touched here: a resumed request
+ * still owns the previous request's last position and rewrites it with the real
+ * first prompt token. */
 static void ds4_session_glm_new_request(ds4_session *s) {
     if (!s) return;
     s->glm_mtp_have = 0;
@@ -62884,7 +63277,8 @@ static void ds4_session_glm_new_request(ds4_session *s) {
 
 /* First plain MTP step of the request: its position is the first position
  * whose nextn KV exists, so it becomes the draft window start.  Later steps
- * and depth switches of the same request keep it, forward or backward. */
+ * and depth switches of the same request keep it, forward or backward.  Only
+ * the sessions that still read a host-named window act on it. */
 static void ds4_session_glm_note_mtp_window_start(ds4_session *s, uint32_t pos) {
     if (!s || s->glm_mtp_min_pos_valid) return;
     s->glm_mtp_min_pos = pos;
@@ -62928,13 +63322,44 @@ static bool ds4_session_glm_mtp_tracked(const ds4_session *s) {
 
 /* The first nextn cache slot a draft may read: the request's window start, kept
  * above the ticket-005 floor of slots that are stale, unknown or failed.
- * ds4_session_glm_mtp_window_start() reports this same value. */
+ * ds4_session_glm_mtp_window_start() reports this same value, and it only ever
+ * picks the window again on the sessions that still use it: see
+ * ds4_session_glm_mtp_selects_positions().  The sessions that select their own
+ * positions only use the floor: ds4_session_glm_mtp_draft_start(). */
 static uint32_t ds4_session_glm_mtp_draft_min_pos(const ds4_session *s) {
     if (!s) return 0u;
     return s->glm_mtp_min_pos > s->glm_mtp_read_floor ?
            s->glm_mtp_min_pos : s->glm_mtp_read_floor;
 }
 
+/* Whether this session's drafter picks its own positions out of the whole
+ * prefix with its own indexer (ticket 007): the GLM-5.3 MTP fast cycle, i.e.
+ * every session that maintains the nextn caches
+ * (ds4_session_glm_mtp_cache_enabled()).  This is a property of the
+ * configuration and nothing at run time changes it.
+ *
+ * What ticket 005 and 006 track at run time does not switch it off.  The read
+ * floor (glm_mtp_read_floor) keeps a slot that is stale, unknown or failed out
+ * of the selection, and ds4_session_glm_mtp_draft_start() hands it to the
+ * drafter; glm_mtp_cache_complete only says whether a .kv snapshot may carry
+ * the nextn section.  Falling back to the contiguous window after the first
+ * failed write or rewind would put the whole session back on the
+ * [min_pos..pos] range this ticket replaces.
+ *
+ * Everywhere else the window stays the 001 one: the legacy MTP cycle, the TP
+ * probe and the nextn cache tests all still hand a [start..pos] range over. */
+static bool ds4_session_glm_mtp_selects_positions(const ds4_session *s) {
+    return s && ds4_session_glm_mtp_cache_enabled(s);
+}
+
+/* The lowest nextn slot the next draft row may read: the ticket-005 read floor
+ * alone when the row picks its own positions (the request's window start plays
+ * no part there), the 001 window start otherwise. */
+static uint32_t ds4_session_glm_mtp_draft_start(const ds4_session *s,
+                                                bool select) {
+    if (!s) return 0u;
+    return select ? s->glm_mtp_read_floor : ds4_session_glm_mtp_draft_min_pos(s);
+}
 /* Take the slot-write failures the graph recorded since the last call: every
  * slot up to and including the failed one goes unreadable, and the seam stops
  * describing a slot whose write failed.  Returns that slot, or
@@ -62974,6 +63399,9 @@ static int ds4_session_glm_mtp_note_token(ds4_session *s, int token) {
      * before its window start by design and is covered by that start. */
     if (ds4_session_glm_mtp_tracked(s) && pos > s->glm_mtp_read_floor) {
         s->glm_mtp_read_floor = pos;
+        /* A slot below the floor is now a slot the caches do not describe, so
+         * they no longer describe the whole prefix (ticket 007). */
+        s->glm_mtp_cache_complete = false;
     }
     return -1;
 }
@@ -65654,15 +66082,20 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
          * no readable last slot, which ds4_session_load_glm_mtp_section()
          * arranged.
          *
-         * What stays as ticket 005 left it is the read floor: which slots a
-         * draft may read is a question this ticket does not touch, so a
-         * restored session still starts reading above the restored prefix --
-         * the same floor ds4_session_glm_mtp_seam_drop() used to leave behind.
-         * The caches being complete is what lets a later ticket lower it. */
-        if (g->glm53) {
+         * The read floor follows what the section restored (ticket 007).  A
+         * section with data (glm_mtp_cache_complete: the nextn caches describe
+         * the whole prefix, the ticket-006 meaning) has no slot a draft must
+         * stay away from, so every slot is readable and the drafter selects
+         * over the whole restored prefix -- a server that resumes from a disk
+         * KV drafts with the same context it had before it stopped.  Without
+         * data the caches describe nothing, and a restored session starts
+         * reading above the restored prefix, as ds4_session_glm_mtp_seam_drop()
+         * leaves it. */
+        if (g->glm53 && ds4_session_glm_mtp_tracked(s)) {
             const uint32_t restored_len = (uint32_t)s->checkpoint.len;
-            if (ds4_session_glm_mtp_tracked(s) &&
-                restored_len > s->glm_mtp_read_floor) {
+            if (s->glm_mtp_cache_complete) {
+                s->glm_mtp_read_floor = 0u;
+            } else if (restored_len > s->glm_mtp_read_floor) {
                 s->glm_mtp_read_floor = restored_len;
             }
         }
@@ -75902,16 +76335,23 @@ static int ds4_session_glm53_fast_spec_cycle(
         const int n1 = glm_session_logits_argmax(s->logits);
         ds4_session_glm_note_mtp_window_start(s, pos);
         int d = -1;
-        const uint32_t min_pos = ds4_session_glm_mtp_draft_min_pos(s);
+        /* The fast cycle lets the drafter pick its own positions out of the
+         * whole prefix, never below the read floor; min_pos is then that floor,
+         * and the 001 window only for the cycles that cannot.  One decision
+         * covers the step and the chain after it, so the chain can never be
+         * asked to reuse a selection it did not make. */
+        const bool select = ds4_session_glm_mtp_selects_positions(s);
+        const uint32_t min_pos = ds4_session_glm_mtp_draft_start(s, select);
         s->glm_mtp_have = 0;
         s->glm_mtp_have2 = false;
-        if (glm_graph_mtp_step(g, m, w, n1, pos, min_pos, &d)) {
+        if (glm_graph_mtp_step(g, m, w, n1, pos, min_pos, select, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
             int d2 = -1;
             if (depth == 3 && pos + 2u <= mtp_cap &&
-                glm53_graph_mtp_chain(g, m, w, d, pos + 1u, min_pos, &d2)) {
+                glm53_graph_mtp_chain(g, m, w, d, pos + 1u, min_pos, select,
+                                      &d2)) {
                 s->glm_mtp_draft2 = d2;
                 s->glm_mtp_have2 = true;
             }
@@ -76069,8 +76509,18 @@ static int ds4_session_glm53_fast_spec_cycle(
                     /* glm_graph_mtp_step() writes this slot and re-parks the
                      * seam with the token it used. */
                     g->mtp_seam_save = true;
+                    /* The write above may have failed, and the row at pos + 1
+                     * reads from the floor: take the failure first, or the
+                     * floor is still the one from before it and the row can
+                     * select the slot at pos, which holds the rejected draft's
+                     * token (requirement 6). */
+                    (void)ds4_session_glm_mtp_absorb_writes(s);
+                    const bool select_next =
+                        ds4_session_glm_mtp_selects_positions(s);
                     if (glm_graph_mtp_step(g, m, w, next, pos + 1u,
-                                           ds4_session_glm_mtp_draft_min_pos(s),
+                                           ds4_session_glm_mtp_draft_start(
+                                               s, select_next),
+                                           select_next,
                                            &nd)) {
                         s->glm_mtp_draft = nd;
                         s->glm_mtp_parent = next;
@@ -76092,19 +76542,24 @@ static int ds4_session_glm53_fast_spec_cycle(
     }
     if (mtp_n != 0) {
         int nd = -1;
+        /* The catch-up rows pick their own positions on the fast cycle, whatever
+         * a rewind or a failed write did to the caches: those only raise the
+         * read floor the rows stay above.  One decision covers the rows and the
+         * chain after them. */
+        const bool select = ds4_session_glm_mtp_selects_positions(s);
+        const uint32_t min_pos = ds4_session_glm_mtp_draft_start(s, select);
         /* The last catch-up row is the request's last position: keep its
          * post-norm hidden as the seam; glm53_graph_mtp_rows() stores it. */
         g->mtp_seam_save = true;
         if (glm53_graph_mtp_rows(g, m, w, mtp_tokens, s->glm53_verify_hc, mtp_n,
-                                 pos, ds4_session_glm_mtp_draft_min_pos(s), &nd)) {
+                                 pos, min_pos, select, &nd)) {
             s->glm_mtp_draft = nd;
             s->glm_mtp_parent = parent;
             s->glm_mtp_have = 1;
             int nd2 = -1;
             if (depth == 3 && pos + mtp_n + 1u <= mtp_cap &&
                 glm53_graph_mtp_chain(g, m, w, nd, pos + mtp_n,
-                                      ds4_session_glm_mtp_draft_min_pos(s),
-                                      &nd2)) {
+                                      min_pos, select, &nd2)) {
                 s->glm_mtp_draft2 = nd2;
                 s->glm_mtp_have2 = true;
             }
@@ -76216,7 +76671,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                            s->glm_mtp_min_pos;
         s->glm_mtp_have = 0;
         if (glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
-                               min_pos, &d)) {
+                               min_pos, false, &d)) {
             s->glm_mtp_draft = d;
             s->glm_mtp_parent = n1;
             s->glm_mtp_have = 1;
@@ -76392,7 +76847,7 @@ static int ds4_session_glm_spec_cycle_impl(
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               min_pos, &dummy);
+                               min_pos, false, &dummy);
         /* The second catch-up row is the request's last position: keep its
          * post-norm hidden as the seam, holding the token this row guessed. */
         if (cu && g->glm53) g->mtp_seam_save = true;
@@ -76402,7 +76857,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                       s->glm_mtp_hc + hc_row_values,
                                       hc_row_bytes) != 0 &&
                  glm_graph_mtp_step(g, &e->model, &e->weights, n2, pos + 1u,
-                                    min_pos, &nd);
+                                    min_pos, false, &nd);
         }
         if (cu) {
             s->glm_mtp_draft = nd;
@@ -76485,6 +76940,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                    pos + 1u,
                                    g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s)
                                             : s->glm_mtp_min_pos,
+                                   false,
                                    &nd)) {
                 s->glm_mtp_draft = nd;
                 s->glm_mtp_parent = next;
@@ -76505,6 +76961,7 @@ static int ds4_session_glm_spec_cycle_impl(
             glm_graph_mtp_step(g, &e->model, &e->weights, n1, pos,
                                g->glm53 ? ds4_session_glm_mtp_draft_min_pos(s)
                                         : s->glm_mtp_min_pos,
+                               false,
                                &nd);
         if (cu) {
             s->glm_mtp_draft = nd;
@@ -80235,7 +80692,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
             int draft = -1;
             if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
+                                   nmax, pos, probe_min_pos, false, &draft)) {
                 probe_draft = draft;
                 probe_have = 1;
             } else {
@@ -88178,6 +88635,10 @@ void ds4_test_glm_zero_mtp_caches(ds4_session *s) {
     if (!ok || !ok_pool || !ok_tail) {
         fprintf(stderr, "ds4-test: glm mtp cache zero failed\n");
     }
+    /* Zeroed caches hold nothing a selection may reuse. */
+    g->mtp_select_valid = false;
+    g->mtp_select_pos = DS4_GLM_MTP_NO_SLOT;
+    g->mtp_select_count = 0;
 }
 
 int ds4_test_glm_mtp_cache_dims(ds4_session *s, uint32_t *kv_dim,
@@ -88251,11 +88712,13 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
     if (draft_logits && draft_logits_cap < DS4_N_VOCAB) return 0;
     /* The row this session just decoded is the step's trunk hidden, exactly as
      * in the fast cycle's plain step, and the step writes the nextn indexer
-     * like every decode row does. */
+     * like every decode row does.  The 004 hook keeps the 001 window: it asks
+     * for the [start..pos] range the host names, not for the row's own choice,
+     * so its semantics are the ones it has always had. */
     g->mtp_indexer_store = 1;
     int drafted = -1;
     if (!glm_graph_mtp_step(g, &s->engine->model, &s->engine->weights,
-                            token, pos, start, &drafted)) {
+                            token, pos, start, false, &drafted)) {
         return 0;
     }
     if (draft) *draft = drafted;
@@ -88264,6 +88727,304 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
                (size_t)DS4_N_VOCAB * sizeof(float));
     }
     return 1;
+}
+
+/* Ticket 007 test hooks: the positions the nextn row picked for itself.
+ *
+ * select_dims() is pure constants -- everything a test needs to size its prompt
+ * and its buffers before it runs anything on the GPU.  The hooks below run the
+ * production plain step, the production chained draft and the production
+ * catch-up rows with the row selecting its own positions, then read the row's
+ * indexer intermediates and its final choice back off the GPU.  None of them
+ * uses the window the host names: that one only exists for the configurations
+ * that do not select, so the min_pos these hooks pass must not change a thing.
+ */
+int ds4_test_glm_mtp_select_dims(uint32_t *pool_size, uint32_t *indexer_top_k,
+                                 uint32_t *selected_limit,
+                                 uint32_t *indexer_head,
+                                 uint32_t *indexer_head_dim) {
+    if (pool_size) *pool_size = DS4_GLM53_INDEX_POOL_SIZE;
+    if (indexer_top_k) *indexer_top_k = DS4_N_INDEXER_TOP_K;
+    if (selected_limit) *selected_limit = glm53_graph_indexer_selected_limit();
+    if (indexer_head) *indexer_head = DS4_N_INDEXER_HEAD;
+    if (indexer_head_dim) *indexer_head_dim = DS4_N_INDEXER_HEAD_DIM;
+    return 1;
+}
+
+int ds4_test_glm_mtp_selects_positions(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    return ds4_session_glm_mtp_selects_positions(s) ? 1 : 0;
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+/* One read-back of a GPU tensor into a caller buffer; a NULL buffer skips it. */
+static int ds4_test_glm_read_f32(const ds4_gpu_tensor *t, float *out,
+                                 uint32_t values, uint32_t cap) {
+    if (!out) return 1;
+    if (!t || values > cap) return 0;
+    return ds4_gpu_tensor_read(t, 0, out, (uint64_t)values * sizeof(float)) != 0;
+}
+
+static int ds4_test_glm_read_u32(const ds4_gpu_tensor *t, uint32_t *out,
+                                 uint32_t values, uint32_t cap) {
+    if (!out) return 1;
+    if (!t || values > cap) return 0;
+    return ds4_gpu_tensor_read(t, 0, out, (uint64_t)values * sizeof(uint32_t)) != 0;
+}
+
+/* Fill the read-back of the selection the last selecting row left behind: its
+ * position, floor and width are what the graph recorded when it chose.  A
+ * chained draft never selects, so it leaves them as the step-0 row set them. */
+static int ds4_test_glm_mtp_read_selection(ds4_glm_gpu_graph *g,
+                                           ds4_test_glm_mtp_select *r) {
+    const uint32_t count = g->mtp_select_count;
+    const uint32_t floor = g->mtp_select_floor;
+    if (!g->mtp_select_valid || count == 0 || floor > g->mtp_select_pos) {
+        return 0;
+    }
+    const uint32_t visible = g->mtp_select_pos + 1u;
+    const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+    const uint32_t scored = visible - floor <= dense_limit ?
+        0u : visible / DS4_GLM53_INDEX_POOL_SIZE;
+    const uint32_t pools = scored == 0u ?
+        0u : DS4_N_INDEXER_TOP_K / DS4_GLM53_INDEX_POOL_SIZE;
+    r->n_selected = count;
+    r->score_rows = scored;
+    r->pools_scored = pools;
+    r->pos = g->mtp_select_pos;
+    r->floor = floor;
+    return ds4_test_glm_read_f32(g->mtp_select_q, r->q,
+                                 DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+                                 r->q_cap) &&
+           ds4_test_glm_read_f32(g->mtp_select_weights, r->weights,
+                                 DS4_N_INDEXER_HEAD, r->weights_cap) &&
+           ds4_test_glm_read_f32(g->mtp_select_scores, r->scores, scored,
+                                 r->scores_cap) &&
+           ds4_test_glm_read_u32(g->mtp_select_pools, r->pools, pools,
+                                 r->pools_cap) &&
+           ds4_test_glm_read_u32(g->mtp_select_ids, r->selected, count,
+                                 r->selected_cap);
+}
+
+static void ds4_test_glm_mtp_draft_out(ds4_glm_gpu_graph *g, float *logits,
+                                       uint32_t logits_cap) {
+    if (logits && logits_cap >= DS4_N_VOCAB) {
+        memcpy(logits, g->mtp_logits_host, (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+}
+
+/* (e) The production plain step at slot checkpoint.len-1 with the row choosing
+ * its own positions over the whole [0 .. checkpoint.len-1] range. */
+int ds4_test_glm_mtp_select_after_decode(ds4_session *s, int token,
+                                         uint32_t min_pos,
+                                         ds4_test_glm_mtp_select *out) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !s->engine || s->checkpoint.len <= 0 || !out) return 0;
+    if (out->logits && out->logits_cap < DS4_N_VOCAB) return 0;
+    const uint32_t pos = (uint32_t)s->checkpoint.len - 1u;
+    /* The hooks draft, they do not maintain the seam. */
+    g->mtp_seam_save = false;
+    g->mtp_indexer_store = 1;
+    int drafted = -1;
+    if (!glm_graph_mtp_step(g, &s->engine->model, &s->engine->weights,
+                            token, pos, min_pos, true, &drafted)) {
+        return 0;
+    }
+    if (g->mtp_select_pos != pos ||
+        !ds4_test_glm_mtp_read_selection(g, out)) {
+        return 0;
+    }
+    out->draft = drafted;
+    ds4_test_glm_mtp_draft_out(g, out->logits, out->logits_cap);
+    return 1;
+}
+
+/* (f) The production chained draft at slot checkpoint.len right after (e),
+ * reusing that step's choice.  It fails on its own when there is no such
+ * choice to reuse, which is a thing the test checks too. */
+int ds4_test_glm_mtp_select_chain_after_decode(ds4_session *s, int token,
+                                               uint32_t min_pos,
+                                               ds4_test_glm_mtp_select *out) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !s->engine || s->checkpoint.len <= 0 || !out) return 0;
+    if (out->logits && out->logits_cap < DS4_N_VOCAB) return 0;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    /* What the step-0 row scored is what the chained row reuses, and the chain
+     * moves the recorded position to its own as soon as it succeeds. */
+    const uint32_t step_pos = g->mtp_select_pos;
+    /* The hooks draft, they do not maintain the seam. */
+    g->mtp_seam_save = false;
+    g->mtp_indexer_store = 1;
+    g->mtp_attn_selected = NULL;
+    g->mtp_attn_n_selected = 0;
+    int drafted = -1;
+    if (!glm53_graph_mtp_chain(g, &s->engine->model, &s->engine->weights,
+                               token, pos, min_pos, true, &drafted)) {
+        return 0;
+    }
+    /* The chained row never selects, so its attention has to have been handed
+     * the step-0 row's own buffer.  Read back that buffer with the count the
+     * attention was really given: a chained row that widened the choice by
+     * its own position, or re-chose into another buffer, shows up here. */
+    const uint32_t n = g->mtp_attn_n_selected;
+    if (step_pos + 1u != pos || g->mtp_select_pos != pos ||
+        g->mtp_attn_selected != g->mtp_select_ids ||
+        n == 0 || !out->selected || n > out->selected_cap ||
+        !ds4_test_glm_read_u32(g->mtp_select_ids, out->selected, n,
+                               out->selected_cap)) {
+        return 0;
+    }
+    /* The chained row scored nothing, so only the choice is reported. */
+    out->n_selected = n;
+    out->score_rows = 0u;
+    out->pools_scored = 0u;
+    out->pos = step_pos;
+    out->floor = g->mtp_select_floor;
+    out->draft = drafted;
+    ds4_test_glm_mtp_draft_out(g, out->logits, out->logits_cap);
+    return 1;
+}
+
+/* The choice on record, see ds4_test_glm_mtp_choice: the last row that
+ * selected, whatever a chained draft or a rewind did to the reuse state. */
+int ds4_test_glm_mtp_choice(ds4_session *s, ds4_test_glm_mtp_choice_info *out) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !out) return 0;
+    out->rows = g->mtp_select_rows;
+    const bool have = g->mtp_select_rows > 0;
+    out->valid = have ? 1 : 0;
+    out->pos = have ? g->mtp_last_pos : 0u;
+    out->floor = have ? g->mtp_last_floor : 0u;
+    out->n_selected = have ? g->mtp_last_count : 0u;
+    if (out->selected && have) {
+        return ds4_test_glm_read_u32(g->mtp_select_ids, out->selected,
+                                     out->n_selected, out->selected_cap);
+    }
+    return 1;
+}
+
+/* (g) The n rows the session could have caught up in one batch, run one at a
+ * time instead: plain steps at [checkpoint.len-1 .. checkpoint.len-1+n-1], each
+ * on the trunk hidden the session just decoded.  The batched twin below runs
+ * the same rows with the same tokens and the same hidden rows, so the two have
+ * to agree. */
+static int ds4_test_glm_mtp_draft_out_run(ds4_glm_gpu_graph *g, uint32_t pos0,
+                                          ds4_test_glm_mtp_run *r) {
+    const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
+    if (r->logits && r->logits_cap < DS4_N_VOCAB) return 0;
+    if (r->kv && r->n * r->kv_dim > r->kv_cap) return 0;
+    if (r->pool && r->n * r->pool_dim > r->pool_cap) return 0;
+    if (r->tail && r->tail_values > r->tail_cap) return 0;
+    for (uint32_t t = 0; t < r->n; t++) {
+        const uint32_t slot = pos0 + t;
+        if (slot >= cache_cap) return 0;
+        if (r->kv &&
+            !ds4_test_glm_read_compact_row(g->mtp_kv_lora_cache, slot,
+                                           DS4_N_KV_LORA,
+                                           r->kv + (uint64_t)t * r->kv_dim,
+                                           r->kv_dim)) {
+            return 0;
+        }
+        if (r->pool &&
+            !ds4_test_glm_read_compact_row(g->mtp_indexer_key_cache,
+                                           slot / DS4_GLM53_INDEX_POOL_SIZE,
+                                           DS4_N_INDEXER_HEAD_DIM,
+                                           r->pool + (uint64_t)t * r->pool_dim,
+                                           r->pool_dim)) {
+            return 0;
+        }
+    }
+    if (r->tail) {
+        const uint64_t values =
+            ds4_gpu_tensor_bytes(g->mtp_indexer_tail_k) / sizeof(float);
+        if (values == 0 || (uint32_t)values > r->tail_cap ||
+            ds4_gpu_tensor_read(g->mtp_indexer_tail_k, 0, r->tail,
+                                values * sizeof(float)) == 0) {
+            return 0;
+        }
+        r->tail_values = (uint32_t)values;
+    }
+    if (r->logits) {
+        memcpy(r->logits, g->mtp_logits_host,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    /* The last row's choice, which is the one that stays in the buffer. */
+    if (!g->mtp_select_valid || g->mtp_select_pos != pos0 + r->n - 1u) {
+        return 0;
+    }
+    r->n_selected = g->mtp_select_count;
+    r->select_pos = g->mtp_select_pos;
+    if (r->selected &&
+        !ds4_test_glm_read_u32(g->mtp_select_ids, r->selected, r->n_selected,
+                               r->selected_cap)) {
+        return 0;
+    }
+    return 1;
+}
+
+int ds4_test_glm_mtp_draft_steps(ds4_session *s, const int *tokens,
+                                 ds4_test_glm_mtp_run *r) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !s->engine || s->checkpoint.len <= 0 || !tokens || !r ||
+        r->n == 0 || r->n > 3u) {
+        return 0;
+    }
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len - 1u;
+    /* The hooks draft, they do not maintain the seam. */
+    g->mtp_seam_save = false;
+    g->mtp_indexer_store = 1;
+    int drafted = -1;
+    for (uint32_t t = 0; t < r->n; t++) {
+        if (!glm_graph_mtp_step(g, m, w, tokens[t], pos0 + t, r->min_pos, true,
+                                &drafted)) {
+            return 0;
+        }
+    }
+    r->draft = drafted;
+    return ds4_test_glm_mtp_draft_out_run(g, pos0, r);
+}
+
+/* The same n rows in one catch-up batch.  glm53_graph_mtp_rows() takes the
+ * trunk hidden rows from the host, so hand it the hidden every plain step read:
+ * g->hc_cur, replicated. */
+int ds4_test_glm_mtp_draft_rows(ds4_session *s, const int *tokens,
+                                ds4_test_glm_mtp_run *r) {
+    ds4_glm_gpu_graph *g = ds4_test_glm_mtp_graph(s);
+    if (!g || !s->engine || s->checkpoint.len <= 0 || !tokens || !r ||
+        r->n == 0 || r->n > 3u) {
+        return 0;
+    }
+    const ds4_model *m = &s->engine->model;
+    const ds4_weights *w = &s->engine->weights;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len - 1u;
+    const uint64_t hc_row_values = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    float *hc = calloc((size_t)r->n * hc_row_values, sizeof(float));
+    if (!hc) return 0;
+    const bool read_ok =
+        ds4_gpu_tensor_read(g->hc_cur, 0, hc,
+                            hc_row_values * sizeof(float)) != 0;
+    if (read_ok) {
+        for (uint32_t t = 1u; t < r->n; t++) {
+            memcpy(hc + (uint64_t)t * hc_row_values, hc,
+                   hc_row_values * sizeof(float));
+        }
+    }
+    /* The hooks draft, they do not maintain the seam. */
+    g->mtp_seam_save = false;
+    g->mtp_indexer_store = 1;
+    int drafted = -1;
+    const bool ok = read_ok && glm53_graph_mtp_rows(g, m, w, tokens, hc, r->n,
+                                                    pos0, r->min_pos, true,
+                                                    &drafted);
+    free(hc);
+    if (!ok) return 0;
+    r->draft = drafted;
+    return ds4_test_glm_mtp_draft_out_run(g, pos0, r);
 }
 
 /* Ticket 005 test hooks: the per-slot write ledger, the read floor, one-shot
@@ -88397,6 +89158,44 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
                                         uint32_t draft_logits_cap) {
     (void)s; (void)token; (void)start;
     (void)draft; (void)draft_logits; (void)draft_logits_cap;
+    return 0;
+}
+int ds4_test_glm_mtp_select_dims(uint32_t *pool_size, uint32_t *indexer_top_k,
+                                 uint32_t *selected_limit,
+                                 uint32_t *indexer_head,
+                                 uint32_t *indexer_head_dim) {
+    (void)pool_size; (void)indexer_top_k; (void)selected_limit;
+    (void)indexer_head; (void)indexer_head_dim;
+    return 0;
+}
+int ds4_test_glm_mtp_selects_positions(ds4_session *s) {
+    (void)s;
+    return 0;
+}
+int ds4_test_glm_mtp_select_after_decode(ds4_session *s, int token,
+                                         uint32_t min_pos,
+                                         ds4_test_glm_mtp_select *out) {
+    (void)s; (void)token; (void)min_pos; (void)out;
+    return 0;
+}
+int ds4_test_glm_mtp_select_chain_after_decode(ds4_session *s, int token,
+                                               uint32_t min_pos,
+                                               ds4_test_glm_mtp_select *out) {
+    (void)s; (void)token; (void)min_pos; (void)out;
+    return 0;
+}
+int ds4_test_glm_mtp_choice(ds4_session *s, ds4_test_glm_mtp_choice_info *out) {
+    (void)s; (void)out;
+    return 0;
+}
+int ds4_test_glm_mtp_draft_steps(ds4_session *s, const int *tokens,
+                                 ds4_test_glm_mtp_run *r) {
+    (void)s; (void)tokens; (void)r;
+    return 0;
+}
+int ds4_test_glm_mtp_draft_rows(ds4_session *s, const int *tokens,
+                                ds4_test_glm_mtp_run *r) {
+    (void)s; (void)tokens; (void)r;
     return 0;
 }
 void ds4_test_glm_mtp_ledger(ds4_session *s, int enable) {

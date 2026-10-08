@@ -5,6 +5,7 @@
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
+#include <float.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
 bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt);
@@ -1021,6 +1022,13 @@ static void test_session_snapshot_roundtrip(void) {
         TEST_ASSERT(fabsf(restored_before[i].logit - before[i].logit) <= 1e-6f);
     }
 
+    if (glm53_mtp && ds4_test_glm_mtp_cache_complete(restored)) {
+        /* A snapshot that carried the nextn caches leaves no slot a draft has
+         * to stay away from, so the restored session reads from slot 0
+         * (ticket 007; ds4.c ds4_session_load_payload, the restored read floor).
+         * The reference counts below only come out the same if it does. */
+        TEST_ASSERT(ds4_test_glm_mtp_read_floor(restored) == 0);
+    }
     if (test_glm_mtp) {
         int restored_total = 0;
         int single_cycles = 0;
@@ -1484,6 +1492,9 @@ static void test_glm_mtp_payload_cross(void) {
                     "pos=%u written=%d\n", seam_kept, seam_pos, seam_written);
             TEST_ASSERT(ds4_test_glm_mtp_cache_complete(session));
             TEST_ASSERT(seam_kept != 0);
+            /* ... and no slot of it is off limits to a draft: the read floor
+             * is 0 (ticket 007; ds4.c ds4_session_load_payload). */
+            TEST_ASSERT(ds4_test_glm_mtp_read_floor(session) == 0);
         } else {
             /* MTP off: the section was skipped whole, with no trailing bytes
              * left over, and nothing claims the caches cover the checkpoint. */
@@ -8565,16 +8576,86 @@ static void test_glm_mtp_verify(void) {
     ds4_tokens_free(&prompt);
 }
 
-/* GLM 5.3 MTP draft window: the nextn KV cache is written only by decode and
- * speculative steps, so prompt prefill leaves those positions unwritten.  Every
- * request must therefore draft over a window that starts at its own first
- * generated position.  The rolling minimum this replaced kept the first
- * request's start for the whole session, so each turn lengthened the window
- * until drafting broke.  Checks a fresh prompt, a resumed-checkpoint
- * continuation and a disk-KV restore, and -- like --glm-mtp-verify -- that every
- * committed token is the plain-decode argmax.  Needs a GLM 5.3 model and
- * DS4_TEST_GLM_MTP=1. */
+/* GLM 5.3 MTP draft window.  Since ticket 007 a step-0 draft row picks the
+ * positions it attends to with the nextn block's own indexer out of the whole
+ * [0 .. pos] prefix, so the window no longer starts at the request's first
+ * generated position -- it starts at 0 wherever the nextn caches cover the
+ * prefix, which is what the fast cycle maintains.  The test still walks a fresh
+ * prompt, a resumed-checkpoint continuation and a disk-KV restore, still checks
+ * -- like --glm-mtp-verify -- that every committed token is the plain-decode
+ * argmax, and now reads the row's own choice back: while the visible range fits
+ * the selection limit it is the whole prefix, position 0 included.  On the
+ * configurations that keep the old rule (DS4_GLM_MTP_LEGACY and everything else
+ * that does not maintain the caches) the window start assertion is what still
+ * decides what a draft reads.  Needs a GLM 5.3 model and DS4_TEST_GLM_MTP=1. */
 #define TEST_GLM_MTP_WINDOW_MIN_TOKENS 32
+
+/* Evidence that a production cycle drafted with the nextn block's own indexer
+ * and not with a host-named window: the graph counts every row that picks its
+ * own positions (and a legacy or unsupported session never moves it), and the
+ * last choice on record has to be the one the selection rule gives for that
+ * row -- every readable position while [floor..pos] fits the selection limit,
+ * the limit's worth of cells (the top-k pools and the whole tail, the rest
+ * padding) beyond it -- with no position below the read floor and none past
+ * the row.  A cell that is not a slot (>= the cache capacity) is the padding
+ * the attention kernel skips (metal/dsv4_misc.metal:3230, `row < args.cache_cap`).
+ * `floor_want` is the floor the last choice must have stayed above, or
+ * TEST_GLM_MTP_FLOOR_ANY when it may only be at or below the session's floor
+ * now (a cycle that fails a write raises the floor after it chose). */
+#define TEST_GLM_MTP_FLOOR_ANY UINT32_MAX  /* sentinel, never a slot index */
+
+static bool test_glm_mtp_cycle_selected(ds4_session *session, const char *label,
+                                        uint32_t floor_want) {
+    uint32_t pool = 0, top_k = 0, lim = 0, head = 0, head_dim = 0;
+    uint32_t kv_dim = 0, pool_dim = 0, tail_dim = 0, cache_cap = 0;
+    if (!ds4_test_glm_mtp_select_dims(&pool, &top_k, &lim, &head, &head_dim) ||
+        !ds4_test_glm_mtp_cache_dims(session, &kv_dim, &pool_dim, NULL, &tail_dim,
+                                     &cache_cap)) {
+        return false;
+    }
+    uint32_t *ids = calloc(lim, sizeof(uint32_t));
+    if (!ids) return false;
+    ds4_test_glm_mtp_choice_info ch = {0};
+    ch.selected = ids;
+    ch.selected_cap = lim;
+    bool ok = ds4_test_glm_mtp_choice(session, &ch) && ch.valid &&
+              ch.floor <= ch.pos;
+    const uint32_t now = ds4_test_glm_mtp_read_floor(session);
+    if (ok && (ch.floor > now ||
+               (floor_want != TEST_GLM_MTP_FLOOR_ANY && ch.floor != floor_want))) {
+        fprintf(stderr, "ds4-test: %s: the last choice stayed above floor %u, "
+                        "the session floor is %u (want %u)\n", label, ch.floor,
+                now, floor_want);
+        ok = false;
+    }
+    if (ok) {
+        const uint32_t readable = ch.pos + 1u - ch.floor;
+        const uint32_t want = readable <= lim ? readable : lim;
+        if (ch.n_selected != want) {
+            fprintf(stderr, "ds4-test: %s: the row at slot %u floor %u selected "
+                            "%u positions, the rule gives %u\n", label, ch.pos,
+                    ch.floor, ch.n_selected, want);
+            ok = false;
+        }
+        for (uint32_t i = 0; ok && i < ch.n_selected; i++) {
+            if (ids[i] >= cache_cap) continue;
+            if (ids[i] < ch.floor || ids[i] > ch.pos ||
+                (readable <= lim && ids[i] != ch.floor + i)) {
+                fprintf(stderr, "ds4-test: %s: cell %u of the row at slot %u is "
+                                "position %u, floor %u\n", label, i, ch.pos,
+                        ids[i], ch.floor);
+                ok = false;
+            }
+        }
+    }
+    if (ok) {
+        fprintf(stderr, "ds4-test: %s: rows=%llu slot=%u floor=%u selects %u "
+                        "positions\n", label, (unsigned long long)ch.rows,
+                ch.pos, ch.floor, ch.n_selected);
+    }
+    free(ids);
+    return ok;
+}
 
 /* One greedy MTP request on an already-synced session: commits tokens with the
  * speculative argmax path and returns how many (or -1 on failure). */
@@ -8583,13 +8664,17 @@ static int test_glm_mtp_window_generate(ds4_engine *engine, ds4_session *session
                                         int *max_chunk, int *single_cycles) {
     char err[192] = {0};
     const int eos = ds4_token_eos(engine);
+    const bool selects = ds4_test_glm_mtp_selects_positions(session) != 0;
     int n = 0;
+    int cycles = 0, selected_cycles = 0;
     *max_chunk = 0;
     *single_cycles = 0;
     while (n < max_tokens) {
         const int first = ds4_session_argmax(session);
         if (first < 0 || first == eos) break;
         int accepted[4] = {0};
+        ds4_test_glm_mtp_choice_info before = {0};
+        (void)ds4_test_glm_mtp_choice(session, &before);
         const int ntok = ds4_session_eval_speculative_argmax(
             session, first, max_tokens - n, eos, accepted,
             (int)(sizeof(accepted) / sizeof(accepted[0])), err, sizeof(err));
@@ -8598,33 +8683,107 @@ static int test_glm_mtp_window_generate(ds4_engine *engine, ds4_session *session
             TEST_ASSERT(false);
             return -1;
         }
+        cycles++;
+        if (selects) {
+            /* A cycle that drafted did it through the nextn indexer's own
+             * choice; one that did not draft (the request ended) leaves the
+             * counter where it was and has nothing to check. */
+            ds4_test_glm_mtp_choice_info after = {0};
+            (void)ds4_test_glm_mtp_choice(session, &after);
+            if (after.rows > before.rows) {
+                selected_cycles++;
+                TEST_ASSERT(test_glm_mtp_cycle_selected(session, "window",
+                                                        TEST_GLM_MTP_FLOOR_ANY));
+            }
+        }
         if (ntok > *max_chunk) *max_chunk = ntok;
         if (ntok == 1) (*single_cycles)++;
         for (int i = 0; i < ntok; i++) {
-            if (accepted[i] == eos) return n;
+            if (accepted[i] == eos) goto done;
             out[n++] = accepted[i];
-            if (n >= max_tokens) return n;
+            if (n >= max_tokens) goto done;
         }
+    }
+done:
+    if (selects) {
+        fprintf(stderr, "ds4-test: glm-mtp-window %d of %d cycles drafted with "
+                        "the nextn indexer's own selection\n",
+                selected_cycles, cycles);
+        TEST_ASSERT(selected_cycles > 0);
     }
     return n;
 }
 
-/* The window start must be decided and be this request's first generated
- * position.  Without the fix the resumed request reports the previous
- * request's start, so a value mismatch is the regression signal. */
+/* What a draft may read after a request.  On a session whose drafter selects
+ * for itself (ticket 007) that is the whole prefix: while it still fits the
+ * selection limit the row's own choice is every position from 0, which is the
+ * direct evidence that the window starts at 0 and not at the request's first
+ * generated position.  Everywhere else the 001 window is what decides, and it
+ * must start at that first generated position; without that rule the resumed
+ * request would report the previous request's start. */
 static void test_glm_mtp_window_expect(ds4_session *session, const char *label,
                                        uint32_t want) {
-    uint32_t start = 0;
-    const bool decided = ds4_session_glm_mtp_window_start(session, &start);
-    if (!decided || start != want) {
-        fprintf(stderr, "ds4-test: glm-mtp-window %s window start %s (want %u)\n",
-                label, decided ? "differs" : "undecided", want);
+    if (!ds4_test_glm_mtp_selects_positions(session)) {
+        uint32_t start = 0;
+        const bool decided = ds4_session_glm_mtp_window_start(session, &start);
+        if (!decided || start != want) {
+            fprintf(stderr, "ds4-test: glm-mtp-window %s window start %s (want %u)\n",
+                    label, decided ? "differs" : "undecided", want);
+        }
+        TEST_ASSERT(decided);
+        TEST_ASSERT(start == want);
+        return;
     }
-    TEST_ASSERT(decided);
-    TEST_ASSERT(start == want);
+    uint32_t pool = 0, top_k = 0, lim = 0, head = 0, head_dim = 0;
+    TEST_ASSERT(ds4_test_glm_mtp_select_dims(&pool, &top_k, &lim, &head,
+                                             &head_dim));
+    const uint32_t v = (uint32_t)ds4_session_pos(session);
+    /* The host-named window is gone on this session; what a draft may not read
+     * is whatever the read floor excludes. */
+    const uint32_t floor = ds4_test_glm_mtp_read_floor(session);
+    uint32_t *sel = calloc(lim, sizeof(uint32_t));
+    TEST_ASSERT(sel != NULL);
+    if (!sel) return;
+    ds4_test_glm_mtp_select r = {0};
+    r.selected = sel;
+    r.selected_cap = lim;
+    const int tok = ds4_session_argmax(session);
+    /* The probe writes slot v-1 with the argmax, which is the token that belongs
+     * in that slot anyway, so it leaves the caches as the next cycle expects. */
+    const bool ok = tok >= 0 &&
+                    ds4_test_glm_mtp_select_after_decode(session, tok, floor, &r);
+    if (!ok) {
+        fprintf(stderr, "ds4-test: glm-mtp-window %s: the draft step could not "
+                        "select its own positions at v=%u\n", label, v);
+        TEST_ASSERT(ok);
+        free(sel);
+        return;
+    }
+    bool zero = false;
+    for (uint32_t i = 0; i < r.n_selected; i++) {
+        if (sel[i] == 0u) zero = true;
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-window %s v=%u limit=%u selects %u "
+                    "positions, position 0 %s\n", label, v, lim, r.n_selected,
+            zero ? "included" : "dropped by the top-k");
+    /* While the readable prefix still fits the limit the choice is all of it,
+     * and the first cell of it is the read floor (position 0 on a clean
+     * session). */
+    if (v - floor <= lim) {
+        if (r.n_selected != v - floor || sel[0] != floor) {
+            fprintf(stderr, "ds4-test: glm-mtp-window %s: v=%u floor=%u selects "
+                            "%u positions starting at %u\n", label, v, floor,
+                    r.n_selected, r.n_selected ? sel[0] : 0u);
+        }
+        TEST_ASSERT(r.n_selected == v - floor);
+        TEST_ASSERT(sel[0] == floor);
+    }
+    free(sel);
 }
 
-/* At a request boundary the start must be re-decided, not inherited. */
+/* At a request boundary the host window is re-decided, never inherited.  It no
+ * longer picks what a selecting draft reads, but the sessions that still use it
+ * must not carry a previous request's start over. */
 static void test_glm_mtp_window_expect_undecided(ds4_session *session,
                                                  const char *label) {
     uint32_t start = 0;
@@ -8658,6 +8817,8 @@ static void test_glm_mtp_window_verify(ds4_engine *engine,
     fprintf(stderr,
             "ds4-test: glm-mtp-window %s prompt=%d tokens=%d worst_argmax_gap=%.3f "
             "at=%d\n", label, prompt->len, n, worst_gap, worst_at);
+    /* Same bound as the MTP verify test (ds4_test.c:8288, "correct: ~0; bug:
+     * ~21 on the reference model"); no separate measurement for this path. */
     TEST_ASSERT(worst_gap <= 2.0f);
 }
 
@@ -8710,6 +8871,12 @@ static void test_glm_mtp_request_window(void) {
     TEST_ASSERT(n1 >= TEST_GLM_MTP_WINDOW_MIN_TOKENS);
     if (n1 < TEST_GLM_MTP_WINDOW_MIN_TOKENS) goto cleanup;
     TEST_ASSERT(chunk1 >= 2);  /* a draft was accepted: the MTP cycle really ran */
+    /* Which of the two rules this configuration is under, so the assertions
+     * below cannot quietly become the easy one. */
+    fprintf(stderr, "ds4-test: glm-mtp-window rule: %s\n",
+            ds4_test_glm_mtp_selects_positions(live)
+                ? "every step-0 row selects its own positions out of [0..pos]"
+                : "the host-named window still decides (legacy or unsupported)");
     test_glm_mtp_window_expect(live, "request 1", want1);
     test_glm_mtp_window_verify(engine, &prompt, gen1, n1, "request 1");
 
@@ -9126,6 +9293,700 @@ static void test_glm_mtp_prefill_resume(ds4_engine *engine,
     free(gen);
 }
 
+/* GLM 5.3 nextn (MTP) position selection (ticket 007): every step-0 draft row
+ * picks the positions it attends to with the nextn block's *own* indexer over
+ * the whole [0 .. pos] range, exactly like a trunk DSA layer picks its decode
+ * positions, and a chained draft reuses the choice of the step-0 row right
+ * before it.  The test walks the visible range across the dense/indexed
+ * boundary and through every pool tail remainder, recomputes the pooled indexer
+ * scores on the CPU in double, and checks the row's choice against them: the
+ * count, the pools the top-k took and the expansion into positions.  Every
+ * length is an expression over the indexer constants, and the prompt is the
+ * shortest one that reaches the widest visible range the test walks.  Needs a
+ * GLM 5.3 model and DS4_TEST_GLM_MTP=1. */
+
+/* Everything every check needs, allocated once for the whole test. */
+typedef struct {
+    uint32_t pool;       /* DS4_GLM53_INDEX_POOL_SIZE */
+    uint32_t top_k;      /* DS4_N_INDEXER_TOP_K */
+    uint32_t lim;        /* glm53_graph_indexer_selected_limit() */
+    uint32_t head;       /* DS4_N_INDEXER_HEAD */
+    uint32_t head_dim;   /* DS4_N_INDEXER_HEAD_DIM */
+    uint32_t vocab, kv_dim, pool_dim, tail_dim, cache_cap;
+    uint32_t pool_rows;  /* widest score_rows the test reads */
+    /* (e)/(f) read-back */
+    float   *q, *weights, *scores, *keys;
+    double  *cpu, *gpu;
+    uint32_t *pools, *selected, *selected_again;
+    /* (g) scratch: the two runs and the caches they left */
+    uint32_t *sel_a, *sel_b;
+    uint32_t *order;
+    float   *logits_a, *logits_b;
+    float   *kv_a, *kv_b, *pool_a, *pool_b, *tail_a, *tail_b;
+} test_glm_mtp_sel;
+
+/* Index order of a score row: highest first, ties by ascending index.  A
+ * tie-break the top-k kernel does not promise (metal/argsort.metal bitonic is
+ * unstable), so ties are counted and printed rather than assumed away. */
+static void test_glm_mtp_sort_desc(const double *score, uint32_t n,
+                                   uint32_t *order) {
+    for (uint32_t i = 0; i < n; i++) order[i] = i;
+    for (uint32_t i = 1; i < n; i++) {
+        const uint32_t k = order[i];
+        uint32_t j = i;
+        while (j > 0u && (score[order[j - 1u]] < score[k] ||
+                          (score[order[j - 1u]] == score[k] &&
+                           order[j - 1u] > k))) {
+            order[j] = order[j - 1u];
+            j--;
+        }
+        order[j] = k;
+    }
+}
+
+/* The chat-formatted prompt, repeated until it is at least `want` tokens and
+ * then trimmed to exactly that many. */
+static bool test_glm_mtp_select_prompt(ds4_engine *engine, ds4_tokens *prompt,
+                                       uint32_t want) {
+    const char *base = test_mtp_copy_prompt();
+    const size_t base_len = strlen(base);
+    size_t text_len = base_len;
+    char *text = malloc(base_len + 1);
+    if (!text) return false;
+    memcpy(text, base, base_len + 1);
+    for (;;) {
+        prompt->len = 0;
+        ds4_chat_begin(engine, prompt);
+        ds4_chat_append_message(engine, prompt, "user", text);
+        ds4_chat_append_assistant_prefix(engine, prompt, DS4_THINK_NONE);
+        if ((uint32_t)prompt->len >= want) break;
+        if (text_len > ((size_t)1 << 26)) {
+            free(text);
+            return false;
+        }
+        char *grown = realloc(text, text_len * 2 + 1);
+        if (!grown) {
+            free(text);
+            return false;
+        }
+        text = grown;
+        memcpy(text + text_len, base, base_len);
+        text_len += base_len;
+        text[text_len] = '\0';
+    }
+    free(text);
+    prompt->len = (int)want;
+    return want > 0u;
+}
+
+/* Sync the checkpoint to the first `len` prompt tokens: a cold prefill the
+ * first time, a resumed one every time after. */
+static bool test_glm_mtp_sync_prefix(ds4_session *s, const ds4_tokens *p,
+                                     uint32_t len, char *err, size_t errlen) {
+    ds4_tokens prefix = {0};
+    if (!p || len > (uint32_t)p->len) return false;
+    for (uint32_t i = 0; i < len; i++) ds4_tokens_push(&prefix, p->v[i]);
+    const bool ok = ds4_session_sync(s, &prefix, err, errlen) == 0;
+    ds4_tokens_free(&prefix);
+    return ok;
+}
+
+/* The padding the expand kernel writes into every cell the choice does not
+ * fill: `uint value = 0xffffffffu` in kernel_glm53_expand_pool_selection
+ * (metal/dsv4_misc.metal:1566), the same value the trunk's indexer leaves in
+ * those cells.  The attention kernel skips a cell whose row is >= cache_cap
+ * (metal/dsv4_misc.metal:3230). */
+#define TEST_GLM_MTP_SELECT_PAD 0xffffffffu
+
+/* The score the nextn selection leaves on a pool it must not take: the value
+ * of mtp_select_skip, which ds4.c fills with -FLT_MAX (ds4.c:51868,
+ * ds4_gpu_tensor_fill_f32(g->mtp_select_skip, -FLT_MAX, ...)).  It is the
+ * lowest float score because the top-k kernel compares plain floats
+ * (metal/argsort.metal:100-120, `reg_value < value` / `shmem_f32[..] <
+ * shmem_f32[..]` with no masking), so a pool at -FLT_MAX is never taken ahead
+ * of a scored one. */
+#define TEST_GLM_MTP_SELECT_SKIPPED (-FLT_MAX)
+
+/* One visible range v, with the read floor the row stayed above: score the
+ * pools the row scored on the CPU in double and check the row's own choice
+ * against them.  While the readable range [floor..v) fits the dense limit the
+ * row selects all of it, which is the direct evidence that the window starts at
+ * the floor (position 0 on a clean session); above it the pools are scored,
+ * the pools that hold a slot below the floor are out of the running, the top-k
+ * is taken and expanded into positions.  In both cases no position below the
+ * floor may be among the cells. */
+static void test_glm_mtp_select_check(ds4_session *s, uint32_t v,
+                                      test_glm_mtp_sel *c,
+                                      ds4_test_glm_mtp_select *r) {
+    const uint32_t fl = r->floor;
+    TEST_ASSERT(r->pos + 1u == v);
+    TEST_ASSERT(fl < v);
+    if (fl >= v) return;
+    const uint32_t readable = v - fl;
+    const uint32_t pools_want = c->top_k / c->pool;
+    /* Pools that hold a slot below the floor, the straddling one included. */
+    const uint32_t skip = (fl + c->pool - 1u) / c->pool;
+    uint32_t bad = 0;
+    int found = 0;
+    /* Nothing below the floor and nothing past the row, in either branch. */
+    for (uint32_t i = 0; i < r->n_selected; i++) {
+        const uint32_t id = r->selected[i];
+        if (id >= c->cache_cap) {
+            if (id != TEST_GLM_MTP_SELECT_PAD && !found) {
+                found = 1;
+                bad = i;
+            }
+            continue;
+        }
+        if ((id < fl || id >= v) && !found) {
+            found = 1;
+            bad = i;
+        }
+    }
+    if (found) {
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u floor=%u: cell %u is %u, "
+                        "outside [floor..v) and not the padding\n", v, fl, bad,
+                r->selected[bad]);
+    }
+    TEST_ASSERT(!found);
+    found = 0;
+    if (readable <= c->lim) {
+        TEST_ASSERT(r->n_selected == readable);
+        TEST_ASSERT(r->score_rows == 0u);
+        for (uint32_t i = 0; i < readable; i++) {
+            if (r->selected[i] != fl + i && !found) {
+                found = 1;
+                bad = i;
+            }
+        }
+        if (found) {
+            fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u floor=%u: "
+                            "dense range differs first at %u (got %u)\n", v,
+                    c->pool, v % c->pool, fl, bad, r->selected[bad]);
+        }
+        TEST_ASSERT(!found);
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u floor=%u dense: "
+                        "%u positions [%u..%u]\n", v, c->pool, v % c->pool, fl,
+                r->n_selected, fl, v - 1u);
+        return;
+    }
+
+    const uint32_t rows = v / c->pool;   /* only whole pools are scored */
+    TEST_ASSERT(r->n_selected == c->lim);
+    TEST_ASSERT(r->score_rows == rows);
+    TEST_ASSERT(r->pools_scored == pools_want);
+    /* The top-k needs pools_want pools above the floor to take. */
+    TEST_ASSERT(rows >= skip + pools_want);
+    if (rows < skip + pools_want) return;
+    for (uint32_t row = 0; row < rows; row++) {
+        if (!ds4_test_glm_read_mtp_kv(s, row * c->pool, NULL, 0,
+                                      c->keys + (uint64_t)row * c->head_dim,
+                                      c->head_dim, NULL, 0)) {
+            fprintf(stderr, "ds4-test: glm-mtp-select v=%u: pooled key row %u "
+                            "is unreadable\n", v, row);
+            TEST_ASSERT(false);
+            return;
+        }
+    }
+    /* C1's score: sum over the heads of max(dot(q_h, key) * scale, 0) * weight.
+     * A pool that holds a slot below the floor is out of the running: the row
+     * leaves the lowest score on it. */
+    const double scale = 1.0 / sqrt((double)c->head_dim * (double)c->head);
+    for (uint32_t row = 0; row < rows; row++) {
+        if (row < skip) {
+            c->cpu[row] = (double)TEST_GLM_MTP_SELECT_SKIPPED;
+            continue;
+        }
+        const float *key = c->keys + (uint64_t)row * c->head_dim;
+        double total = 0.0;
+        for (uint32_t h = 0; h < c->head; h++) {
+            const float *qh = c->q + (uint64_t)h * c->head_dim;
+            double dot = 0.0;
+            for (uint32_t d = 0; d < c->head_dim; d++) {
+                dot += (double)qh[d] * (double)key[d];
+            }
+            if (dot * scale > 0.0) total += dot * scale * (double)c->weights[h];
+        }
+        c->cpu[row] = total;
+    }
+    float max_abs = 0.0f, max_rel = 0.0f;
+    for (uint32_t row = 0; row < rows; row++) {
+        if (row < skip) {
+            /* Exactly the constant the skip copy wrote. */
+            if (r->scores[row] != TEST_GLM_MTP_SELECT_SKIPPED) {
+                fprintf(stderr, "ds4-test: glm-mtp-select v=%u floor=%u: pool %u "
+                                "holds a slot below the floor but scores %.6g\n",
+                        v, fl, row, r->scores[row]);
+                TEST_ASSERT(false);
+            }
+            continue;
+        }
+        const float want = (float)c->cpu[row];
+        const float got = r->scores[row];
+        const float d = fabsf(got - want);
+        const float m = fabsf(got) > fabsf(want) ? fabsf(got) : fabsf(want);
+        if (d > max_abs) max_abs = d;
+        if (m > 0.0f && d / m > max_rel) max_rel = d / m;
+    }
+
+    /* Choice vs the scores the GPU itself used: exact self-consistency.  The
+     * top-k kernel is free to pick any of the pools tied with the K-th, so only
+     * the pools strictly above the cut are demanded. */
+    for (uint32_t row = 0; row < rows; row++) c->gpu[row] = r->scores[row];
+    test_glm_mtp_sort_desc(c->gpu, rows, c->order);
+    const double gpu_cut = c->gpu[c->order[pools_want - 1u]];
+    unsigned char *gpu_in = calloc(rows, 1);
+    TEST_ASSERT(gpu_in != NULL);
+    if (!gpu_in) return;
+    for (uint32_t i = 0; i < pools_want; i++) {
+        const uint32_t p = r->pools[i];
+        if (p >= rows || p < skip || gpu_in[p]) {
+            fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u floor=%u: "
+                            "pool %u of %u is out of range, below the floor or "
+                            "taken twice\n", v, c->pool, v % c->pool, fl, p, rows);
+            TEST_ASSERT(false);
+            free(gpu_in);
+            return;
+        }
+        gpu_in[p] = 1;
+    }
+    for (uint32_t row = 0; row < rows; row++) {
+        const double score = c->gpu[row];
+        if (score > gpu_cut && !gpu_in[row]) {
+            fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u: pool %u "
+                            "scores above the cut but was not taken\n", v,
+                    c->pool, v % c->pool, row);
+            TEST_ASSERT(false);
+        }
+        if (gpu_in[row] && score < gpu_cut) {
+            fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u: pool %u "
+                            "scores below the cut but was taken\n", v, c->pool,
+                    v % c->pool, row);
+            TEST_ASSERT(false);
+        }
+    }
+
+    /* Choice vs the CPU scores: the same top-k, pool for pool. */
+    test_glm_mtp_sort_desc(c->cpu, rows, c->order);
+    uint32_t diff = 0;
+    for (uint32_t i = 0; i < pools_want; i++) {
+        if (!gpu_in[c->order[i]]) diff++;
+    }
+    uint32_t cpu_ties = 0;
+    for (uint32_t i = 0; i < rows; i++) {
+        if (c->cpu[i] == c->cpu[c->order[pools_want - 1u]]) cpu_ties++;
+    }
+    fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u floor=%u rows=%u "
+                    "skipped=%u pools=%u score max_abs=%.6g max_rel=%.6g "
+                    "cpu_diff=%u cpu_ties=%u\n",
+            v, c->pool, v % c->pool, fl, rows, skip, pools_want, max_abs,
+            max_rel, diff, cpu_ties);
+    TEST_ASSERT(diff == 0u);
+
+    /* The expansion: every taken pool contributes all POOL of its positions,
+     * the pool the row sits in contributes the positions it holds, and the rest
+     * of the tail cells are the padding the attention kernel skips. */
+    for (uint32_t i = 0; i < c->top_k; i++) {
+        const uint32_t want = r->pools[i / c->pool] * c->pool + (i % c->pool);
+        if (r->selected[i] != want && !found) {
+            found = 1;
+            bad = i;
+        }
+    }
+    const uint32_t tail = v % c->pool;
+    for (uint32_t j = 0; j + 1u < c->pool; j++) {
+        const uint32_t want = j < tail ? v - tail + j : TEST_GLM_MTP_SELECT_PAD;
+        if (r->selected[c->top_k + j] != want && !found) {
+            found = 1;
+            bad = c->top_k + j;
+        }
+    }
+    if (found) {
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u: expand differs "
+                        "first at %u (got %u)\n", v, c->pool, v % c->pool, bad,
+                r->selected[bad]);
+    }
+    TEST_ASSERT(!found);
+    /* The row's own position is always selected: the incomplete tail pool is
+     * taken whole no matter what its score says. */
+    if (tail != 0u) TEST_ASSERT(r->selected[c->top_k] == v - tail);
+    free(gpu_in);
+}
+
+/* (f) The chained draft reuses the step-0 choice one for one: the count its
+ * attention was really handed (read back off the graph, not the count the step
+ * recorded) and the positions in the buffer it read, with the chained row's own
+ * position added by nobody.  `e` is the step-0 row right before it. */
+static void test_glm_mtp_select_check_chain(uint32_t v,
+                                            const test_glm_mtp_sel *c,
+                                            const ds4_test_glm_mtp_select *e,
+                                            const ds4_test_glm_mtp_select *f) {
+    uint32_t bad = 0;
+    int found = 0;
+    TEST_ASSERT(f->pos == e->pos);
+    TEST_ASSERT(f->floor == e->floor);
+    TEST_ASSERT(f->n_selected == e->n_selected);
+    for (uint32_t i = 0; i < e->n_selected && i < f->n_selected; i++) {
+        if (f->selected[i] != e->selected[i] && !found) {
+            found = 1;
+            bad = i;
+        }
+    }
+    if (found) {
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u: the chained "
+                        "draft differs first at %u (chain %u, step %u)\n", v,
+                c->pool, v % c->pool, bad, f->selected[bad], e->selected[bad]);
+    }
+    TEST_ASSERT(!found);
+    fprintf(stderr, "ds4-test: glm-mtp-select v=%u v%%%u=%u chain reuses all %u "
+                    "positions (step selected %u)\n", v, c->pool, v % c->pool,
+            f->n_selected, e->n_selected);
+}
+
+/* (g) The same n rows over the same slots two ways, with identical inputs: the
+ * draft logits and every cache row they leave have to agree.  Printed without a
+ * threshold this round -- only finiteness and the top-1 are asserted. */
+static void test_glm_mtp_select_rows(ds4_session *s, const ds4_tokens *p,
+                                     uint32_t v, uint32_t n,
+                                     test_glm_mtp_sel *c) {
+    ds4_test_glm_mtp_run steps = {0}, rows = {0};
+    ds4_token_score top_a[8], top_b[8];
+    int tokens[3] = { -1, -1, -1 };
+    /* Slot pos holds the row built from the token at pos+1. */
+    for (uint32_t t = 0; t < n && t < 3u; t++) {
+        const uint32_t at = v + t;
+        tokens[t] = p->v[at < (uint32_t)p->len ? at : (uint32_t)p->len - 1u];
+    }
+    steps.n = n;
+    /* No floor: the session is clean here, and a floor above the first row's
+     * slot is refused. */
+    steps.min_pos = 0u;
+    steps.selected = c->sel_a;  steps.selected_cap = c->lim;
+    steps.logits = c->logits_a;
+    steps.logits_cap = c->vocab;
+    steps.kv = c->kv_a;      steps.kv_dim = c->kv_dim;
+    steps.kv_cap = n * c->kv_dim;
+    steps.pool = c->pool_a;  steps.pool_dim = c->pool_dim;
+    steps.pool_cap = n * c->pool_dim;
+    steps.tail = c->tail_a;  steps.tail_cap = c->tail_dim;
+    rows = steps;
+    rows.selected = c->sel_b;
+    rows.logits = c->logits_b;
+    rows.kv = c->kv_b;     rows.pool = c->pool_b;     rows.tail = c->tail_b;
+    if (!ds4_test_glm_mtp_draft_steps(s, tokens, &steps) ||
+        !ds4_test_glm_mtp_draft_rows(s, tokens, &rows)) {
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u rows n=%u: one of the two "
+                        "runs failed\n", v, n);
+        TEST_ASSERT(false);
+        return;
+    }
+    TEST_ASSERT(steps.tail_values != 0u &&
+                steps.tail_values == rows.tail_values &&
+                steps.tail_values <= c->tail_dim);
+    TEST_ASSERT(test_glm_mtp_row_finite(c->logits_a, c->vocab) &&
+                test_glm_mtp_row_finite(c->logits_b, c->vocab));
+    test_glm_mtp_top_k(c->logits_a, (int)c->vocab, 8, top_a);
+    test_glm_mtp_top_k(c->logits_b, (int)c->vocab, 8, top_b);
+    float labs = 0.0f, lrel = 0.0f, kabs = 0.0f, krel = 0.0f;
+    float pabs = 0.0f, prel = 0.0f, tabs = 0.0f, trel = 0.0f;
+    test_glm_mtp_row_diff(c->logits_a, c->logits_b, c->vocab, &labs, &lrel);
+    test_glm_mtp_row_diff(c->kv_a, c->kv_b, n * c->kv_dim, &kabs, &krel);
+    test_glm_mtp_row_diff(c->pool_a, c->pool_b, n * c->pool_dim, &pabs, &prel);
+    test_glm_mtp_row_diff(c->tail_a, c->tail_b, steps.tail_values, &tabs, &trel);
+    fprintf(stderr, "ds4-test: glm-mtp-select v=%u rows n=%u: draft %d/%d "
+                    "logits max_abs=%.6g max_rel=%.6g kv max_abs=%.6g "
+                    "pool max_abs=%.6g tail max_abs=%.6g top8_overlap=%d\n",
+            v, n, steps.draft, rows.draft, labs, lrel, kabs, pabs, tabs,
+            (int)test_top_tokens_overlap(top_a, top_b, 8));
+    TEST_ASSERT(top_a[0].id == top_b[0].id);
+    TEST_ASSERT(steps.draft == rows.draft);
+    /* What the last row attended to: the row-at-a-time run and the catch-up
+     * batch must have picked the same positions, cell for cell. */
+    uint32_t sel_bad = 0;
+    int sel_found = 0;
+    TEST_ASSERT(steps.select_pos == rows.select_pos);
+    TEST_ASSERT(steps.n_selected == rows.n_selected);
+    for (uint32_t i = 0; i < steps.n_selected && i < rows.n_selected; i++) {
+        if (steps.selected[i] != rows.selected[i] && !sel_found) {
+            sel_found = 1;
+            sel_bad = i;
+        }
+    }
+    if (sel_found) {
+        fprintf(stderr, "ds4-test: glm-mtp-select v=%u rows n=%u: the batch "
+                        "picked position %u where the steps picked %u (cell %u)\n",
+                v, n, rows.selected[sel_bad], steps.selected[sel_bad], sel_bad);
+    }
+    TEST_ASSERT(!sel_found);
+    fprintf(stderr, "ds4-test: glm-mtp-select v=%u rows n=%u: last row at slot "
+                    "%u selected %u/%u positions\n", v, n, steps.select_pos,
+            steps.n_selected, rows.n_selected);
+}
+
+static void test_glm_mtp_select(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        fprintf(stderr, "ds4-test: glm-mtp-select skipped (needs a GLM 5.3 model "
+                        "and DS4_TEST_GLM_MTP=1)\n");
+        return;
+    }
+
+    test_glm_mtp_sel c = {0};
+    ds4_tokens prompt = {0};
+    ds4_session *s = NULL;
+    ds4_test_glm_mtp_select e = {0}, f = {0}, again = {0};
+    char err[256] = {0};
+    bool ok = false;
+
+    TEST_ASSERT(ds4_test_glm_mtp_select_dims(&c.pool, &c.top_k, &c.lim,
+                                             &c.head, &c.head_dim));
+    TEST_ASSERT(c.pool > 1u && c.top_k >= c.pool && c.head > 0u &&
+                c.head_dim > 0u);
+    /* R2: the width of one selection is top_k + (pool - 1). */
+    TEST_ASSERT(c.lim == c.top_k + c.pool - 1u);
+    /* The widest visible range: two whole pools dropped by the top-k, and every
+     * tail remainder from 0 to pool-1 walked on the way there. */
+    const uint32_t v_max = c.lim + 1u + 2u * c.pool;
+    const int ctx = (int)(v_max + 2u);
+    const uint32_t rows_max = v_max / c.pool;
+    c.pool_rows = rows_max;
+    c.vocab = (uint32_t)ds4_engine_vocab_size(engine);
+
+    c.q = malloc((size_t)c.head * c.head_dim * sizeof(float));
+    c.weights = malloc((size_t)c.head * sizeof(float));
+    c.scores = malloc((size_t)rows_max * sizeof(float));
+    c.keys = malloc((size_t)rows_max * c.head_dim * sizeof(float));
+    c.cpu = malloc((size_t)rows_max * sizeof(double));
+    c.gpu = malloc((size_t)rows_max * sizeof(double));
+    c.pools = malloc((size_t)(c.top_k / c.pool) * sizeof(uint32_t));
+    c.selected = malloc((size_t)c.lim * sizeof(uint32_t));
+    c.selected_again = malloc((size_t)c.lim * sizeof(uint32_t));
+    c.sel_a = malloc((size_t)c.lim * sizeof(uint32_t));
+    c.sel_b = malloc((size_t)c.lim * sizeof(uint32_t));
+    c.order = malloc((size_t)rows_max * sizeof(uint32_t));
+    c.logits_a = malloc((size_t)c.vocab * sizeof(float));
+    c.logits_b = malloc((size_t)c.vocab * sizeof(float));
+    ok = c.q && c.weights && c.scores && c.keys && c.cpu && c.gpu && c.pools &&
+         c.selected && c.selected_again && c.sel_a && c.sel_b && c.order &&
+         c.logits_a && c.logits_b;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    if (!test_glm_mtp_select_prompt(engine, &prompt, v_max + 1u)) {
+        fprintf(stderr, "ds4-test: glm-mtp-select could not build a %u token "
+                        "prompt\n", v_max + 1u);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    if (ds4_session_create(&s, engine, ctx) != 0) {
+        fprintf(stderr, "ds4-test: glm-mtp-select: ds4_session_create refused "
+                        "ctx %d for a %u token prompt\n", ctx, v_max + 1u);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    if (!ds4_test_glm_mtp_cache_dims(s, &c.kv_dim, &c.pool_dim, NULL,
+                                     &c.tail_dim, &c.cache_cap)) {
+        fprintf(stderr, "ds4-test: glm-mtp-select: the session keeps no nextn "
+                        "caches: MTP is off or unsupported here\n");
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    if (v_max >= c.cache_cap) {
+        fprintf(stderr, "ds4-test: glm-mtp-select: the nextn cache holds %u "
+                        "slots, below the %u positions the test walks\n",
+                c.cache_cap, v_max);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    /* The (g) scratch follows the cache row widths, which only the session
+     * knows. */
+    c.kv_a = calloc(3u * c.kv_dim, sizeof(float));
+    c.kv_b = calloc(3u * c.kv_dim, sizeof(float));
+    c.pool_a = calloc(3u * c.pool_dim, sizeof(float));
+    c.pool_b = calloc(3u * c.pool_dim, sizeof(float));
+    c.tail_a = calloc(c.tail_dim, sizeof(float));
+    c.tail_b = calloc(c.tail_dim, sizeof(float));
+    ok = c.kv_a && c.kv_b && c.pool_a && c.pool_b && c.tail_a && c.tail_b &&
+         c.pool_dim == c.head_dim;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    e.q = c.q;             e.q_cap = c.head * c.head_dim;
+    e.weights = c.weights; e.weights_cap = c.head;
+    e.scores = c.scores;   e.scores_cap = rows_max;
+    e.pools = c.pools;     e.pools_cap = c.top_k / c.pool;
+    e.selected = c.selected; e.selected_cap = c.lim;
+    f = e;
+    /* (f) reads into its own copy so the comparison below is not reading the
+     * same buffer twice. */
+    f.pools = malloc((size_t)(c.top_k / c.pool) * sizeof(uint32_t));
+    f.selected = malloc((size_t)c.lim * sizeof(uint32_t));
+    /* The floor probes re-run (e) above a read floor and back at 0.  They read
+     * the same intermediates as (e): the check recomputes the pool scores. */
+    again = e;
+    again.selected = c.selected_again;
+    ok = f.pools && f.selected;
+    TEST_ASSERT(ok);
+    if (!ok) goto cleanup;
+
+    /* ---- 1. three catch-up rows across the dense/indexed boundary ---- */
+    if (!test_glm_mtp_sync_prefix(s, &prompt, c.lim - 1u, err, sizeof(err))) {
+        fprintf(stderr, "ds4-test: glm-mtp-select sync %u: %s\n", c.lim - 1u, err);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    /* The rule under test only runs where the caches cover the prefix. */
+    TEST_ASSERT(ds4_test_glm_mtp_dense(s));
+    TEST_ASSERT(ds4_test_glm_mtp_cache_complete(s));
+    test_glm_mtp_select_rows(s, &prompt, c.lim - 1u, 3u, &c);
+
+    /* ---- 2. the widest range that still selects everything ---- */
+    if (!test_glm_mtp_sync_prefix(s, &prompt, c.lim, err, sizeof(err))) {
+        fprintf(stderr, "ds4-test: glm-mtp-select sync %u: %s\n", c.lim, err);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    if (!ds4_test_glm_mtp_select_after_decode(s, prompt.v[c.lim], 0u, &e)) {
+        fprintf(stderr, "ds4-test: glm-mtp-select (e) at v=%u failed\n", c.lim);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    test_glm_mtp_select_check(s, c.lim, &c, &e);
+    if (!ds4_test_glm_mtp_select_chain_after_decode(s, prompt.v[c.lim + 1u],
+                                                    0u, &f)) {
+        fprintf(stderr, "ds4-test: glm-mtp-select (f) at v=%u failed\n", c.lim);
+        TEST_ASSERT(false);
+        goto cleanup;
+    }
+    test_glm_mtp_select_check_chain(c.lim, &c, &e, &f);
+    test_glm_mtp_select_rows(s, &prompt, c.lim, 2u, &c);
+
+    /* ---- 3. every tail remainder, then two whole pools dropped ---- */
+    for (uint32_t step = 1u; step <= c.pool + 1u; step++) {
+        uint32_t v = c.lim + step;
+        if (step > c.pool) v = v_max;
+        if (!test_glm_mtp_sync_prefix(s, &prompt, v, err, sizeof(err))) {
+            fprintf(stderr, "ds4-test: glm-mtp-select sync %u: %s\n", v, err);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+        const int next = prompt.v[v < (uint32_t)prompt.len ? v
+                                                           : (uint32_t)prompt.len - 1u];
+        if (!ds4_test_glm_mtp_select_after_decode(s, next, 0u, &e)) {
+            fprintf(stderr, "ds4-test: glm-mtp-select (e) at v=%u failed\n", v);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+        test_glm_mtp_select_check(s, v, &c, &e);
+        /* The widest range walked: the same row again above a read floor.  The
+         * floors are expressions over the widest range v_max = lim + 1 + 2*pool,
+         * chosen to land on each branch of the selection:
+         *   pool + 1          straddles pool 1 (a slot below it, a slot above),
+         *                     top-k with two pools dropped to the floor;
+         *   v_max - lim - 1   the largest floor that still leaves more than lim
+         *                     readable positions: the tightest top-k, a whole
+         *                     number of pools below it (2 * pool);
+         *   v_max - lim       exactly lim readable positions although v_max > lim:
+         *                     the dense branch above a floor;
+         *   v_max - 1         the row's own slot is the only readable one. */
+        if (v == v_max) {
+            const uint32_t floors[4] = { c.pool + 1u, v_max - c.lim - 1u,
+                                         v_max - c.lim, v_max - 1u };
+            for (uint32_t k = 0; k < 4u; k++) {
+                if (!ds4_test_glm_mtp_select_after_decode(s, next, floors[k], &e)) {
+                    fprintf(stderr, "ds4-test: glm-mtp-select (e) at v=%u floor "
+                                    "%u failed\n", v, floors[k]);
+                    TEST_ASSERT(false);
+                    goto cleanup;
+                }
+                TEST_ASSERT(e.floor == floors[k]);
+                test_glm_mtp_select_check(s, v, &c, &e);
+            }
+            /* The floor is the only thing that moved: with it back at 0 the
+             * choice is the one the first probe made. */
+            if (!ds4_test_glm_mtp_select_after_decode(s, next, 0u, &again)) {
+                fprintf(stderr, "ds4-test: glm-mtp-select (e) at v=%u after the "
+                                "floors failed\n", v);
+                TEST_ASSERT(false);
+                goto cleanup;
+            }
+            test_glm_mtp_select_check(s, v, &c, &again);
+        }
+        if (step == 1u || step == c.pool || step == c.pool + 1u) {
+            const int second = prompt.v[v + 1u < (uint32_t)prompt.len ? v + 1u
+                                                                      : (uint32_t)prompt.len - 1u];
+            if (!ds4_test_glm_mtp_select_chain_after_decode(s, second, 0u, &f)) {
+                fprintf(stderr, "ds4-test: glm-mtp-select (f) at v=%u failed\n", v);
+                TEST_ASSERT(false);
+                goto cleanup;
+            }
+            /* The step right before the chain is the last (e) that ran. */
+            test_glm_mtp_select_check_chain(v, &c, v == v_max ? &again : &e, &f);
+        }
+    }
+
+    /* ---- 4. a production cycle drafts through the same selection ----
+     * The checkpoint sits at v_max, so the cycle is a plain step followed by
+     * its draft row at slot v_max, which sees v_max + 1 positions: the top-k
+     * branch.  The graph counts every row that picks its own positions, and
+     * nothing but the nextn indexer moves that counter, so a cycle that drafted
+     * with a host-named window leaves it where it was. */
+    {
+        ds4_test_glm_mtp_choice_info before = {0}, after = {0};
+        const int eos = ds4_token_eos(engine);
+        const int first = ds4_session_argmax(s);
+        int accepted[4] = {0};
+        TEST_ASSERT(ds4_test_glm_mtp_selects_positions(s));
+        TEST_ASSERT(ds4_test_glm_mtp_choice(s, &before));
+        TEST_ASSERT(first >= 0 && first != eos);
+        if (first < 0 || first == eos) goto cleanup;
+        const int ntok = ds4_session_eval_speculative_argmax(
+            s, first, 4, eos, accepted, 4, err, sizeof(err));
+        if (ntok < 1) {
+            fprintf(stderr, "ds4-test: glm-mtp-select production cycle failed: "
+                            "%s\n", err);
+            TEST_ASSERT(false);
+            goto cleanup;
+        }
+        TEST_ASSERT(ds4_test_glm_mtp_choice(s, &after));
+        TEST_ASSERT(after.rows > before.rows);
+        TEST_ASSERT(after.valid && after.pos == v_max);
+        TEST_ASSERT(test_glm_mtp_cycle_selected(s, "glm-mtp-select cycle",
+                                                TEST_GLM_MTP_FLOOR_ANY));
+        /* v_max + 1 readable positions from floor 0 is above the limit: the
+         * choice is the top-k width. */
+        if (after.floor == 0u) TEST_ASSERT(after.n_selected == c.lim);
+    }
+
+    ok = true;
+
+cleanup:
+    ds4_session_free(s);
+    ds4_tokens_free(&prompt);
+    free(c.q);
+    free(c.weights);
+    free(c.scores);
+    free(c.keys);
+    free(c.cpu);
+    free(c.gpu);
+    free(c.pools);
+    free(c.selected);
+    free(c.selected_again);
+    free(c.sel_a);
+    free(c.sel_b);
+    free(c.order);
+    free(c.logits_a);
+    free(c.logits_b);
+    free(c.kv_a);
+    free(c.kv_b);
+    free(c.pool_a);
+    free(c.pool_b);
+    free(c.tail_a);
+    free(c.tail_b);
+    free(f.pools);
+    free(f.selected);
+}
+
 static void test_glm_mtp_prefill_write(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine || !ds4_engine_is_glm53(engine) || !test_env_bool("DS4_TEST_GLM_MTP")) {
@@ -9521,8 +10382,9 @@ cleanup:
  * free-form -- its next token does not exist yet -- but a write there can only
  * have used that position's own hidden, and unless the floor passed it the
  * session must still hold the hidden a rewrite needs. */
-static bool test_glm_mtp_commit_invariant(ds4_session *session, const char *label,
-                                          int step) {
+static bool test_glm_mtp_commit_invariant_from(ds4_session *session,
+                                               const char *label, int step,
+                                               uint32_t min_slot) {
     const ds4_tokens *h = ds4_session_tokens(session);
     if (!h || h->len <= 0) return true;
     const uint32_t l = (uint32_t)h->len;
@@ -9538,6 +10400,9 @@ static bool test_glm_mtp_commit_invariant(ds4_session *session, const char *labe
     uint32_t lo = ds4_test_glm_mtp_dense(session) ? floor
                  : (decided ? start : l);
     if (lo < floor) lo = floor;
+    /* min_slot: slots below it were restored from a payload, so the ledger
+     * (which only sees this session's own writes) never recorded them. */
+    if (lo < min_slot) lo = min_slot;
     for (uint32_t p = lo; p + 2u <= l; p++) {
         uint32_t tok = 0, hid = 0;
         const int r = ds4_test_glm_mtp_ledger_slot(session, p, &tok, &hid);
@@ -9570,6 +10435,11 @@ static bool test_glm_mtp_commit_invariant(ds4_session *session, const char *labe
     }
     if (!ok) fflush(stderr);
     return ok;
+}
+
+static bool test_glm_mtp_commit_invariant(ds4_session *session, const char *label,
+                                          int step) {
+    return test_glm_mtp_commit_invariant_from(session, label, step, 0);
 }
 
 /* One nextn KV row read back, and the max absolute difference of two rows. */
@@ -10295,6 +11165,12 @@ cleanup:
 /* --glm-mtp-commit-fail: a nextn write that fails must make that slot (and
  * everything below it) unreadable, must not fail the request, and must not
  * happen again on the cycles that follow. */
+
+/* How many tokens one speculative cycle may hand back in accepted[]: the size
+ * every other GLM MTP cycle test gives it (`int accepted[4]` in
+ * test_glm_mtp_window_generate and the glm-mtp-select production cycle). */
+#define TEST_GLM_MTP_FAIL_ACCEPT_CAP 4
+
 static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
                                           const ds4_tokens *prompt, int ctx,
                                           int kind, const char *label) {
@@ -10408,13 +11284,37 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
             ok = ok && start >= floor_after;
         }
         int committed = 0;
+        /* A failed write takes the slot (and everything below it) off the
+         * readable list; it must not take the session off the nextn indexer's
+         * own selection, which is what keeps the drafter off the contiguous
+         * window this ticket replaced.  The completeness flag only decides
+         * whether a snapshot may carry the nextn section (ticket 006).  A
+         * chained draft row's failure is not a slot failure at all. */
+        TEST_ASSERT(ds4_test_glm_mtp_selects_positions(session));
+        if (kind != DS4_TEST_GLM_MTP_FAIL_CHAIN) {
+            TEST_ASSERT(!ds4_test_glm_mtp_cache_complete(session));
+        }
+        /* What the recovery commits, checked against plain decode like
+         * --glm-mtp-verify: the prefix is everything committed so far, and rec
+         * holds the loop's token budget plus the last cycle's accepted[]. */
+        ds4_tokens rec_prefix = {0};
+        int rec[TEST_GLM_MTP_WINDOW_MIN_TOKENS + TEST_GLM_MTP_FAIL_ACCEPT_CAP] = {0};
+        int n_rec = 0;
+        int selected_cycles = 0, cycles_run = 0;
+        const ds4_tokens *so_far = ds4_session_tokens(session);
+        for (int i = 0; so_far && i < so_far->len; i++) {
+            ds4_tokens_push(&rec_prefix, so_far->v[i]);
+        }
         for (int cycle = 1; ok && committed < TEST_GLM_MTP_WINDOW_MIN_TOKENS &&
                             cycle <= TEST_MTP_MAXGEN; cycle++) {
             const int first = ds4_session_argmax(session);
             if (first < 0 || first == eos) break;
-            int accepted[4] = {0};
+            int accepted[TEST_GLM_MTP_FAIL_ACCEPT_CAP] = {0};
+            ds4_test_glm_mtp_choice_info before = {0}, after = {0};
+            (void)ds4_test_glm_mtp_choice(session, &before);
             const int ntok = ds4_session_eval_speculative_argmax(
-                session, first, 4, eos, accepted, 4, err, sizeof(err));
+                session, first, TEST_GLM_MTP_FAIL_ACCEPT_CAP, eos, accepted,
+                TEST_GLM_MTP_FAIL_ACCEPT_CAP, err, sizeof(err));
             if (ntok < 1) {
                 fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s recovery cycle %d "
                                 "failed: %s\n", label, cycle, err);
@@ -10422,10 +11322,22 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
                 ok = false;
                 break;
             }
+            cycles_run++;
+            (void)ds4_test_glm_mtp_choice(session, &after);
+            if (after.rows > before.rows) {
+                /* The row drafted through the nextn indexer, above the floor
+                 * the failure left and at the width the rule gives. */
+                selected_cycles++;
+                TEST_ASSERT(test_glm_mtp_cycle_selected(session, label,
+                                                        floor_after));
+            }
             for (int i = 0; i < ntok; i++) {
                 if (accepted[i] == eos) {
                     committed = TEST_GLM_MTP_WINDOW_MIN_TOKENS;
                     break;
+                }
+                if (n_rec < (int)(sizeof(rec) / sizeof(rec[0]))) {
+                    rec[n_rec++] = accepted[i];
                 }
                 committed++;
             }
@@ -10443,7 +11355,16 @@ static void test_glm_mtp_commit_fail_kind(ds4_engine *engine,
             }
         }
         fprintf(stderr, "ds4-test: glm-mtp-commit-fail %s: recovered with %d "
-                        "tokens at floor %u\n", label, committed, floor_after);
+                        "tokens at floor %u, %d of %d cycles selected their own "
+                        "positions\n", label, committed, floor_after,
+                selected_cycles, cycles_run);
+        TEST_ASSERT(selected_cycles > 0);
+        if (ok && n_rec > 0) {
+            /* The bound inside is the MTP verify test's worst_gap <= 2.0f
+             * (ds4_test.c:8288, "correct: ~0; bug: ~21"). */
+            test_glm_mtp_window_verify(engine, &rec_prefix, rec, n_rec, label);
+        }
+        ds4_tokens_free(&rec_prefix);
     }
     ds4_session_free(session);
 }
@@ -10478,8 +11399,11 @@ static void test_glm_mtp_commit_fail_load(ds4_engine *engine,
     ok = ds4_session_create(&restored, engine, ctx) == 0;
     TEST_ASSERT(ok);
     if (!ok) goto cleanup;
-    /* The ledger goes on before the load: the invariant below only walks slots
-     * the restored session writes itself, at or above the floor the load left. */
+    /* The ledger goes on before the load.  The load restores the slots below
+     * the loaded length from the payload, which the ledger never sees, so the
+     * ledger invariant below walks only the slots the restored session writes
+     * itself (at or above the loaded length); the restored slots are checked
+     * separately, by content, right after the load. */
     ds4_test_glm_zero_mtp_caches(restored);
     ds4_test_glm_mtp_ledger(restored, 1);
     ok = ds4_session_load_payload(restored, fp, (uint64_t)bytes, err, sizeof(err)) == 0;
@@ -10488,15 +11412,38 @@ static void test_glm_mtp_commit_fail_load(ds4_engine *engine,
         fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: %s\n", err);
         goto cleanup;
     }
-    /* The restored prefix stays below the read floor: the payload now carries
-     * the nextn caches and the seam (ticket 006), but which slots a draft may
-     * read is still the rule ticket 005 left, so the load keeps the floor a
-     * seam drop used to leave. */
+    /* Ticket 007: the file was written by a fresh synced session, so its MTP
+     * section carried data and the restored nextn caches describe the whole
+     * prefix.  Every slot is then readable: the load leaves the read floor at
+     * 0 instead of raising it to the restored length (the ticket-005 rule). */
     const uint32_t floor = ds4_test_glm_mtp_read_floor(restored);
-    fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: pos=%d floor=%u\n",
-            ds4_session_pos(restored), floor);
-    TEST_ASSERT(floor >= (uint32_t)ds4_session_pos(restored));
-    ok = floor >= (uint32_t)ds4_session_pos(restored);
+    const uint32_t loaded = (uint32_t)ds4_session_pos(restored);
+    fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: pos=%u floor=%u complete=%d\n",
+            loaded, floor, ds4_test_glm_mtp_cache_complete(restored));
+    TEST_ASSERT(ds4_test_glm_mtp_cache_complete(restored) != 0);
+    TEST_ASSERT(floor == 0u);
+    ok = ds4_test_glm_mtp_cache_complete(restored) != 0 && floor == 0u;
+    /* The caches were zeroed before the load, so a written (finite, non-zero)
+     * row proves the load restored that slot.  The last slot (loaded - 1) is
+     * free-form -- it waits for its real next token -- so it is not required
+     * to hold a row; every slot below it is. */
+    uint32_t kv_dim = 0, pool_dim = 0, pool_size = 0, tail_dim = 0, cap = 0;
+    if (ok) {
+        ok = ds4_test_glm_mtp_cache_dims(restored, &kv_dim, &pool_dim, &pool_size,
+                                        &tail_dim, &cap) != 0;
+        TEST_ASSERT(ok);
+    }
+    for (uint32_t p = 0; ok && p + 1u < loaded; p++) {
+        float *row = test_glm_mtp_commit_row(restored, p, kv_dim);
+        const bool written = row != NULL && test_glm_mtp_row_written(row, kv_dim);
+        free(row);
+        if (!written) {
+            fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: restored slot %u "
+                            "holds no row\n", p);
+            ok = false;
+        }
+        TEST_ASSERT(written);
+    }
     for (int i = 0; ok && i < prompt->len; i++) ds4_tokens_push(&next, prompt->v[i]);
     ds4_tokens_push(&next, ds4_session_argmax(restored));
     ok = ds4_session_sync(restored, &next, err, sizeof(err)) == 0;
@@ -10518,17 +11465,25 @@ static void test_glm_mtp_commit_fail_load(ds4_engine *engine,
                     cycle, err);
             break;
         }
-        /* Everything at or above the floor the load left is trustworthy, and
-         * nothing below it enters the draft window. */
-        if (!test_glm_mtp_commit_invariant(restored, "load", cycle + 1)) {
+        /* Every slot this session wrote after the load (at or above the loaded
+         * length) holds the right token and hidden, and no draft window starts
+         * below the floor. */
+        if (!test_glm_mtp_commit_invariant_from(restored, "load", cycle + 1,
+                                                loaded)) {
             ok = false;
             break;
         }
         committed += ntok;
     }
+    /* Nothing in this run fails a nextn write or drops the seam, and those are
+     * the only paths that raise the floor (absorb_writes, seam_drop, the
+     * note_token retire), so the floor the load left stays 0.  Rewinds of
+     * rejected drafts clear glm_mtp_cache_complete without raising the floor,
+     * so completeness is not asserted here. */
+    const uint32_t floor_after = ds4_test_glm_mtp_read_floor(restored);
     fprintf(stderr, "ds4-test: glm-mtp-commit-fail load: floor %u after %d "
-                    "committed tokens\n", ds4_test_glm_mtp_read_floor(restored),
-            committed);
+                    "committed tokens\n", floor_after, committed);
+    if (ok) TEST_ASSERT(floor_after == 0u);
 
 cleanup:
     if (fp) fclose(fp);
@@ -10683,7 +11638,8 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
     {"--glm-mtp-verify", "glm-mtp-verify", "GLM 5.3 MTP commits plain-decode argmax tokens on both accept and reject", test_glm_mtp_verify},
-    {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP drafts from the current request's first generated position after a resume or a disk-KV restore", test_glm_mtp_request_window},
+    {"--glm-mtp-window", "glm-mtp-window", "GLM 5.3 MTP commits plain-decode argmax tokens across a resume and a disk-KV restore while each row selects its own positions from 0", test_glm_mtp_request_window},
+    {"--glm-mtp-select", "glm-mtp-select", "GLM 5.3 MTP picks its own attention positions with its own indexer over [0..pos], and a chained draft reuses them", test_glm_mtp_select},
     {"--glm-mtp-prefill", "glm-mtp-prefill", "GLM 5.3 MTP prefill writes the nextn KV and indexer caches, and the seam fills the row that waits for its token", test_glm_mtp_prefill_write},
     {"--glm-mtp-payload-cross", "glm-mtp-payload-cross", "GLM 5.3 .kv files cross the MTP on/off boundary: complete caches restore the seam, a file without them is a miss", test_glm_mtp_payload_cross},
     {"--glm-mtp-commit-token", "glm-mtp-commit-token", "GLM 5.3 MTP slots hold the real committed token and their own position's hidden across plain steps, mixed sampling and resample rewinds", test_glm_mtp_commit_token},
@@ -10727,6 +11683,7 @@ static void test_print_help(const char *prog) {
     puts("  DS4_TEST_GLM_MTP_MAX_CHUNK=N   Pin the widest commit --glm-mtp-verify expects. Unset: DS4_GLM_MTP_DEPTH=2/3 expects that width, automatic depth only expects 2..3.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_TOKENS=N  Tokens to generate per request in --glm-mtp-window. Default: 64.");
     puts("  DS4_TEST_GLM_MTP_WINDOW_CTX=N     Session context for --glm-mtp-window. Default: 4096.");
+    puts("  --glm-mtp-select needs no prompt or length of its own: every length is an expression over the GLM 5.3 indexer constants.");
     puts("  DS4_TEST_PAYLOAD_MODE=save|load   Which side of the MTP on/off boundary --glm-mtp-payload-cross exercises.");
     puts("  DS4_TEST_PAYLOAD_FILE=PATH        .kv file --glm-mtp-payload-cross writes or reads.");
     puts("  DS4_GLM_MTP_LEGACY=1              Run the legacy GLM MTP cycle; --glm-mtp-commit-token covers it (its rewrites fill the nextn KV alone).");

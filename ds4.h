@@ -483,9 +483,16 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 void ds4_session_free_test_checkpoint(ds4_session *s);
-/* Test helpers (ds4-test): GLM MTP draft attention window start for the request
- * that is generating now.  Returns false while the start is undecided (no
- * plain MTP step has run since the request began); position 0 is a valid start. */
+/* Test helpers (ds4-test): the GLM MTP draft attention window the host named for
+ * the request that is generating now.  Returns false while the start is
+ * undecided (no plain MTP step has run since the request began); position 0 is a
+ * valid start.  Since ticket 007 this only decides what a draft reads on the
+ * sessions that still use a host-named window -- GLM 5.2, and every GLM-5.3
+ * configuration that does not maintain the nextn caches densely (the legacy
+ * cycle, TP, layer slices, ssd streaming, multi tier, dense prefill).  A
+ * GLM-5.3 fast-cycle session keeps recording it, but its draft rows pick their
+ * own positions out of the whole prefix with their own indexer, and the value
+ * here plays no part in that: see ds4_test_glm_mtp_selects_positions(). */
 bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out);
 /* Test helpers (ds4-test): GLM-5.3 nextn (MTP) cache probes.  Zero every nextn
  * cache of a session (compact KV, pooled indexer key and the raw K/gate tail),
@@ -494,7 +501,10 @@ bool ds4_session_glm_mtp_window_start(const ds4_session *s, uint32_t *start_out)
  * plain MTP step the fast cycle runs right after a decode (cache slot =
  * checkpoint.len-1, attention window [start .. checkpoint.len-1]).  All are
  * no-ops off the GLM-5.3 GPU path; the seam itself is only ever maintained by
- * the production sync/decode paths. */
+ * the production sync/decode paths.  On the sessions ticket 007 covers the
+ * fast cycle no longer uses that window -- see ds4_test_glm_mtp_select_*
+ * below -- but this hook keeps asking for it by name, so its meaning is the
+ * one it has always had. */
 void ds4_test_glm_zero_mtp_caches(ds4_session *s);
 /* Row widths in floats for the buffers above: the KV row, one pooled indexer
  * row, the pool size, the whole raw tail window and the nextn cache capacity.
@@ -511,6 +521,117 @@ int ds4_test_glm_mtp_draft_after_decode(ds4_session *s, int token,
                                         uint32_t start, int *draft,
                                         float *draft_logits,
                                         uint32_t draft_logits_cap);
+/* Test helpers (ds4-test, ticket 007): the positions the GLM-5.3 nextn drafter
+ * picks for itself with its own indexer over the whole [0 .. pos] range.
+ * select_dims() is pure constants, no GPU work: the indexer pool size, the
+ * indexer top-k, the most positions one selection can ever hold
+ * (top_k + pool - 1), the indexer head count and one indexer head's width --
+ * everything needed to size a prompt and the buffers below.  A selecting row
+ * reads the min_pos it is handed as its read floor (ticket 005): no position
+ * below it is selected, and 0 is the trunk's own selection.
+ *
+ * ds4_test_glm_mtp_select reads one selecting row back: the token it drafted,
+ * its logits, and -- for the rows that score the pools instead of taking
+ * everything -- the indexer query, the head weights, the per-pool scores, the
+ * pools the top-k took and the expanded positions.  Every buffer is optional;
+ * a NULL one is skipped, and a non-NULL one has to be big enough.  The row
+ * selects everything while pos+1 still fits the dense limit, and then
+ * score_rows and pools_scored come back 0 with nothing to compare.
+ *
+ * ds4_test_glm_mtp_run is one n-row catch-up and the nextn caches it left:
+ * the drafted token, its logits and every slot's KV row, pooled indexer row
+ * and the raw K/gate tail window. */
+typedef struct {
+    int       draft;          /* out: the token this row drafted */
+    float    *logits;         /* out: DS4_N_VOCAB draft logits, or NULL */
+    uint32_t  logits_cap;
+    float    *q;              /* out: indexer_head * indexer_head_dim floats */
+    uint32_t  q_cap;
+    float    *weights;        /* out: indexer_head floats */
+    uint32_t  weights_cap;
+    float    *scores;         /* out: score_rows floats */
+    uint32_t  scores_cap;
+    uint32_t *pools;          /* out: pools_scored pool row indices */
+    uint32_t  pools_cap;
+    uint32_t *selected;       /* out: n_selected absolute positions */
+    uint32_t  selected_cap;
+    uint32_t  n_selected;     /* out: what the row attends to */
+    uint32_t  score_rows;     /* out: 0 when the row selected everything */
+    uint32_t  pools_scored;   /* out: pools the top-k chose from */
+    uint32_t  pos;            /* out: slot of the row that made the choice */
+    uint32_t  floor;          /* out: the read floor that row stayed above */
+} ds4_test_glm_mtp_select;
+
+typedef struct {
+    uint32_t  n;              /* in: rows to run, 1..3 */
+    uint32_t  min_pos;        /* in: the read floor of every row */
+    int       draft;          /* out: the last row's drafted token */
+    float    *logits;         /* out: DS4_N_VOCAB draft logits, or NULL */
+    uint32_t  logits_cap;
+    uint32_t *selected;       /* out: the last row's positions, or NULL */
+    uint32_t  selected_cap;
+    uint32_t  n_selected;     /* out: how many the last row attended to */
+    uint32_t  select_pos;     /* out: slot of the row that made them */
+    float    *kv;             /* out: n * kv_dim floats, or NULL */
+    uint32_t  kv_dim;
+    uint32_t  kv_cap;
+    float    *pool;           /* out: n * pool_dim floats, or NULL */
+    uint32_t  pool_dim;
+    uint32_t  pool_cap;
+    float    *tail;           /* out: tail_values floats, or NULL */
+    uint32_t  tail_cap;
+    uint32_t  tail_values;    /* out */
+} ds4_test_glm_mtp_run;
+
+int ds4_test_glm_mtp_select_dims(uint32_t *pool_size, uint32_t *indexer_top_k,
+                                 uint32_t *selected_limit,
+                                 uint32_t *indexer_head,
+                                 uint32_t *indexer_head_dim);
+/* Non-zero while this session's drafter picks its own positions: the GLM-5.3
+ * MTP fast cycle (every session that maintains the nextn caches).  It does not
+ * depend on anything that changes at run time, so a failed write or a rewind
+ * leaves it set and only raises the read floor.  Where it is zero the 001
+ * window rule still decides what a draft reads. */
+int ds4_test_glm_mtp_selects_positions(ds4_session *s);
+/* The choice on record after anything ran: how many rows picked their own
+ * positions since the session's graph was built, and the last of them -- the
+ * slot of the row that ran the nextn indexer (not the slot of a chained draft
+ * that reused its choice afterwards), the read floor it stayed above, how many
+ * positions it chose and the positions themselves (`selected` is optional).
+ * A chained draft and a rewind do not change it; only the next selecting row
+ * does.  `valid` is 0 until a selecting row ran.  Reads back from the GPU only
+ * when `selected` is set. */
+typedef struct {
+    uint64_t  rows;           /* out: selecting rows so far */
+    int       valid;          /* out */
+    uint32_t  pos;            /* out */
+    uint32_t  floor;          /* out */
+    uint32_t  n_selected;     /* out */
+    uint32_t *selected;       /* out: n_selected positions, or NULL */
+    uint32_t  selected_cap;
+} ds4_test_glm_mtp_choice_info;
+int ds4_test_glm_mtp_choice(ds4_session *s, ds4_test_glm_mtp_choice_info *out);
+/* (e) The production plain step at slot checkpoint.len-1, choosing its own
+ * positions over [0 .. checkpoint.len-1]. */
+int ds4_test_glm_mtp_select_after_decode(ds4_session *s, int token,
+                                         uint32_t min_pos,
+                                         ds4_test_glm_mtp_select *out);
+/* (f) The production chained draft at slot checkpoint.len right after (e),
+ * reusing that step's choice one for one.  It fails when no selecting step ran
+ * at the position right before it, instead of falling back to a window.  What
+ * comes back is what the chained row's attention was really handed: the buffer
+ * it read and the count it was given, not what (e) left on record. */
+int ds4_test_glm_mtp_select_chain_after_decode(ds4_session *s, int token,
+                                               uint32_t min_pos,
+                                               ds4_test_glm_mtp_select *out);
+/* (g) The same n rows over the same slots two ways: one plain step at a time,
+ * each reading the trunk hidden the session just decoded, and one catch-up
+ * batch fed that same hidden row for every row.  Identical inputs, so the two
+ * runs have to leave identical caches and the same last draft. */
+int ds4_test_glm_mtp_draft_steps(ds4_session *s, const int *tokens,
+                                 ds4_test_glm_mtp_run *r);
+int ds4_test_glm_mtp_draft_rows(ds4_session *s, const int *tokens,
+                                ds4_test_glm_mtp_run *r);
 /* Test helpers (ds4-test, ticket 005): per-slot bookkeeping of the GLM-5.3
  * nextn (MTP) cache writes.  Everything here is off by default and costs
  * nothing on the production path.
